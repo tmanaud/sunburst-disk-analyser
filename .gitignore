@@ -1,0 +1,6 @@
+/target
+/dist
+.DS_Store
+nimbalyst-local/
+# Local review notes (contain machine-specific paths)
+docs/adversarial-review-*.md

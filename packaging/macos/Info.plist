@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Sunburst Disk Analyser</string>
+    <key>CFBundleDisplayName</key>
+    <string>Sunburst Disk Analyser</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.tmanaud.sunburst-disk-analyser</string>
+    <key>CFBundleExecutable</key>
+    <string>sunburst-disk-analyser</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>fr</string>
+        <string>de</string>
+        <string>es</string>
+        <string>it</string>
+        <string>ru</string>
+        <string>uk</string>
+        <string>zh-Hans</string>
+    </array>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Sunburst Disk Analyser measures the size of the files in the folders you scan.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Sunburst Disk Analyser measures the size of the files in the folders you scan.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Sunburst Disk Analyser measures the size of the files in the folders you scan.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Sunburst Disk Analyser measures the size of the files on the disks you scan.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Sunburst Disk Analyser measures the size of the files on the disks you scan.</string>
+</dict>
+</plist>

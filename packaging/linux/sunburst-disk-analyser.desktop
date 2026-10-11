@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Sunburst Disk Analyser
+GenericName=Disk Usage Analyser
+GenericName[fr]=Analyseur d’espace disque
+Comment=See what takes up space on your disks
+Comment[fr]=Visualisez ce qui occupe vos disques
+Exec=sunburst-disk-analyser %f
+Icon=sunburst-disk-analyser
+Terminal=false
+Categories=Utility;System;Filesystem;
+MimeType=inode/directory;
+StartupWMClass=sunburst-disk-analyser

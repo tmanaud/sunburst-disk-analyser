@@ -1,0 +1,108 @@
+# Sunburst Disk Analyser
+
+See what is filling up your disks. Sunburst Disk Analyser scans a disk or a folder, shows it as an interactive sunburst chart next to a size-sorted outline, and lets you move what you no longer need to the Trash, or move or copy it elsewhere.
+
+One native binary per platform, for **macOS**, **Windows** and **Linux**. No installer, no account, no telemetry.
+
+![Overview](docs/screenshots/overview.png)
+
+| Folders outline | Biggest files |
+| --- | --- |
+| ![Columns](docs/screenshots/columns.png) | ![Biggest files](docs/screenshots/biggest-files.png) |
+
+| Review before removing | Light appearance |
+| --- | --- |
+| ![Review](docs/screenshots/review.png) | ![Light](docs/screenshots/light.png) |
+
+The screenshots show built-in sample data (`--demo`), not a real disk.
+
+## Features
+
+- **Fast parallel scan** with live results while it runs; stop it at any time. A 74 GB folder with about 590,000 files took 2.5 s on an Apple Silicon laptop SSD.
+- **Sunburst chart**: one ring per folder level, hover a segment for its size, file count and date, click to select it, double-click to dive in, click the centre to go back up.
+- **Folders Outline**: size-sorted columns; click a folder to open it in the next column. Tiny and hidden items are grouped so the big ones stand out.
+- **Biggest Files**: the largest files of the whole scan in one list.
+- **Search by name** in the scanned items.
+- **Select, review, then act**: tick items, check the list, then move them to the Trash, or move or copy them to another folder. Nothing is deleted permanently and nothing is overwritten.
+- **Whole disks**: free space and space the scan could not attribute are shown next to your files.
+- Favourite folders, drag and drop of folders onto the window, CSV report export, show in Finder / Explorer / file manager, Quick Look (macOS), copy path.
+- Dark, light or automatic appearance. English, French, German, Spanish, Italian, Russian, Ukrainian and Simplified Chinese.
+
+## Download
+
+Get the file for your system from the [latest release](https://github.com/tmanaud/sunburst-disk-analyser/releases/latest).
+
+| System | File | First launch |
+| --- | --- | --- |
+| macOS 11+ (Apple Silicon and Intel) | `…-macos-universal.dmg` | Open the disk image and drag the app to Applications. The app is not notarised by Apple: the first time, right-click it and choose **Open**, or allow it in System Settings → Privacy & Security. |
+| Windows 10/11 x64 | `…-windows-x64.zip` | Unzip and run `Sunburst Disk Analyser.exe`. SmartScreen may warn about an unknown publisher: **More info → Run anyway**. |
+| Linux x86_64 | `…-linux-x86_64.AppImage` or `.tar.gz` | `chmod +x` the AppImage and run it. Needs glibc 2.35+ and OpenGL. The folder picker uses the desktop portal (`xdg-desktop-portal`). The `.tar.gz` holds the bare binary and also needs `libxkbcommon` and, on X11, `libxkbcommon-x11`. |
+
+`SHA256SUMS.txt` in each release lists the checksums.
+
+### Disk access on macOS
+
+macOS asks before an app may read Desktop, Documents, Downloads and removable disks. To measure every folder, including Mail and other protected data, add the app in System Settings → Privacy & Security → **Full Disk Access**. Folders that could not be read are counted and reported after the scan.
+
+## Using it
+
+1. Pick your home folder, a disk or a folder on the left, or drop a folder on the window.
+2. Click **Start Scanning**.
+3. Explore with the outline and the chart. Right-click any item for more actions.
+4. Tick what you want to get rid of and click **Review and Remove**. The arrow next to the button switches to **Move** or **Copy**.
+
+From a terminal:
+
+```
+sunburst-disk-analyser [FOLDER]        scan a folder right away
+sunburst-disk-analyser --lang fr       force a language (en fr de es it ru uk zh)
+sunburst-disk-analyser --theme light   force an appearance
+sunburst-disk-analyser --demo          show sample data
+```
+
+## How sizes are measured
+
+- **macOS and Linux**: space allocated on disk, so sparse files and iCloud files that are not downloaded count for what they really use. A file with several hard links is counted once. The scan stays on the scanned file system and does not follow symbolic links.
+- **Windows**: file length; OneDrive online-only files count as zero. Junctions and symbolic links are not followed.
+- Scanning never downloads cloud-only files.
+- On APFS, clones and snapshots share blocks, so the sum of your files can differ from what the system reports as used. When a whole disk is scanned, the difference appears as **Other used space**.
+
+## Safety
+
+- Remove means **move to the Trash / Recycle Bin**. Space is freed when you empty it.
+- Volume roots, your home folder, its standard folders and operating system folders cannot be selected. Hidden items are protected until you allow them in Settings.
+- Every item is checked again right before it is touched; an item that disappeared or was replaced since the review is skipped and reported.
+- Move and copy never overwrite: on a name clash the new item gets a numbered name. A copy that fails part-way leaves nothing behind.
+- **Move** works within one volume. To move something to another disk, copy it, check the copy, then remove the original: the app will not delete the source of a copy on its own.
+- These checks narrow, but cannot fully close, the window in which another program changes a file between the check and the operation.
+
+## Known limits
+
+- macOS "purgeable" space is not broken out separately.
+- Hard links: on macOS and Linux a file with several names is counted under the first name found, the others show as empty; after removing the counted name, scan again for exact figures. On Windows each name is counted.
+- Copies carry the file content, permissions and modification date, not extended attributes, resource forks, ACLs or NTFS alternate data streams.
+- File icons are generic (folder, file, application), not the per-type system icons.
+- Quick Look preview exists only on macOS; other systems open the file with its default application.
+- The Windows and Linux builds are produced and unit-tested by CI but have had less hands-on testing than the macOS build.
+
+## Build from source
+
+Requires a recent stable [Rust](https://rustup.rs) toolchain.
+
+```
+cargo run --release
+```
+
+Packaged builds: `packaging/build-macos.sh`, `packaging/build-linux.sh`, `packaging/build-windows.ps1`. On Linux install `libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev` (or your distribution's equivalents) first.
+
+The screenshots are rendered by the app itself: `sunburst-disk-analyser --screenshot overview out.png`.
+
+## Credits
+
+Written in Rust with [egui](https://github.com/emilk/egui). Interface font: [Inter](https://rsms.me/inter/) (SIL Open Font License).
+
+The workflow is inspired by Nektony's Disk Space Analyzer for macOS. This is an independent project with its own code, name and artwork; it is not affiliated with or endorsed by Nektony.
+
+## License
+
+[MIT](LICENSE)
