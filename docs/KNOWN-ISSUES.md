@@ -41,15 +41,22 @@ noted further down.
   an unprivileged user with two tmpfs mounts: `NO_TRASH_DIR` pointing into a
   volume whose root that user cannot write to (removal refused, file intact)
   and `VOLUME_TRASH_DIR` into one it can (item lands in `.Trash-<uid>`).
-- Windows: `cargo check --target x86_64-pc-windows-gnu` only. Nothing was run.
+- Windows: the unit tests pass on the CI runner (`windows-latest`), which
+  covers copy, move, collision names, the identity check and stopping a copy
+  on an internal NTFS drive. The app itself was never launched there, and
+  removal is not covered by a test that runs by default.
+- The pinned release workflow ran green on all three platforms on its first
+  push (build jobs; the release job only runs on a tag).
 
 ## Not verified
 
-1. **Windows, at run time.** Never executed. In particular:
+1. **Windows, beyond the unit tests.** The app was never launched. In
+   particular:
    - `Ident::of` reads the volume serial and file index with
      `GetFileInformationByHandle` on a handle opened with no access rights.
-     If that open fails for ordinary files, every operation is refused with
-     "changed since it was scanned".
+     It works for the CI's temporary files; untested on network drives,
+     cloud placeholders and files the user cannot open. Where it fails the
+     operation is refused with "changed since it was scanned".
    - `has_recycle_bin` allows removal only when `GetDriveTypeW` says
      `DRIVE_FIXED`. Unchecked on real hardware: external USB hard disks,
      mapped drives, `subst` drives, paths with the `\\?\` prefix.
@@ -66,7 +73,8 @@ noted further down.
 5. **Deep trees.** A copy holds two descriptors per folder level and raises
    the open-files limit to 8192. Beyond that it fails with "too many open
    files" and cleans up; not exercised.
-6. **The pinned workflow.** First run happens on the push that carries it.
+6. **The release job of the pinned workflow.** Only the build jobs have run
+   since the pinning; the release job runs on the next tag.
 
 ## Known limits, by design or not done
 
