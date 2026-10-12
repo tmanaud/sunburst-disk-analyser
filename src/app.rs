@@ -4,7 +4,8 @@ use crate::i18n::{self, t, tf};
 use crate::ops::{self, OpKind, OpProgress};
 use crate::platform::{self, LocKind, Location, Space};
 use crate::scan::{self, ScanHandle};
-use crate::session::{CheckError, GroupKind, Session, Tab};
+use crate::session::{CheckError, GroupKind, Session, Step, Tab};
+use crate::swipe::Swipe;
 use crate::settings::{Appearance, Settings};
 use crate::theme::{self, Palette};
 use crate::tree::NodeId;
@@ -45,6 +46,8 @@ pub enum Cmd {
     TabOutline,
     TabBiggest,
     ToggleChart,
+    GoBack,
+    GoForward,
     GoParent,
     GoRoot,
     Remove,
@@ -66,7 +69,9 @@ pub enum Action {
     RowClick { col: usize, id: NodeId },
     FlatClick(NodeId),
     SelectPath(NodeId),
-    Drill(NodeId),
+    Step(Step),
+    /// Open a file with its default application.
+    Open(NodeId),
     Hover(NodeId, bool),
     ToggleCheck(NodeId),
     ToggleGroup(NodeId, GroupKind),
@@ -139,6 +144,12 @@ pub struct App {
     pub actions: Vec<Action>,
     pub hover_lock: bool,
     pub focus_search: bool,
+    /// Right edge of the macOS window buttons, 0 when the window shows none.
+    pub lights: f32,
+    pub thumbs: crate::thumb::Thumbs,
+    swipe: Swipe,
+    /// Time of the last trackpad scroll event.
+    trackpad_at: f64,
     #[cfg(target_os = "macos")]
     native_menu: Option<crate::menu::NativeMenu>,
     applied_dark: Option<bool>,
@@ -177,6 +188,10 @@ impl App {
             actions: Vec::new(),
             hover_lock: false,
             focus_search: false,
+            lights: if cfg!(target_os = "macos") { 76.0 } else { 0.0 },
+            thumbs: Default::default(),
+            swipe: Swipe::default(),
+            trackpad_at: f64::NEG_INFINITY,
             #[cfg(target_os = "macos")]
             native_menu: None,
             applied_dark: None,
@@ -307,7 +322,7 @@ impl App {
         }
     }
 
-    fn info_for(&self, id: Option<NodeId>) -> Option<InfoData> {
+    pub fn info_for(&self, id: Option<NodeId>) -> Option<InfoData> {
         if let Some(s) = self.session() {
             let id = id.unwrap_or_else(|| s.target());
             let tree = s.scan.tree.read();
@@ -352,6 +367,7 @@ impl App {
             CheckError::Hidden => t("Hidden items are protected. You can allow removing them in Settings."),
             CheckError::System => t("This item is required by the system and cannot be selected."),
             CheckError::Empty => t("This file takes up no space on your disk. There is no need to remove it."),
+            CheckError::Unscanned => t("This folder was not scanned completely and cannot be selected."),
         }
     }
 
@@ -523,6 +539,11 @@ impl App {
                     s.mark_dirty();
                 }
             }
+            Cmd::GoBack | Cmd::GoForward => {
+                if let Some(s) = self.session_mut() {
+                    s.go_history(cmd == Cmd::GoForward);
+                }
+            }
             Cmd::GoParent => {
                 if let Some(s) = self.session_mut() {
                     s.go_parent();
@@ -568,6 +589,11 @@ impl App {
                 _ => self.run_cmd(c, Some(id), ctx),
             },
             Action::QuickRemove(id) => self.review_single(OpKind::Remove, id),
+            Action::Open(id) => {
+                if let Some(p) = self.target_path(Some(id)).filter(|_| !self.opts.demo) {
+                    platform::open_file(&p);
+                }
+            }
             Action::SelectLocation(loc) => {
                 self.current = Some(loc);
             }
@@ -597,7 +623,7 @@ impl App {
                         s.focus = Some(id);
                     }
                     Action::SelectPath(id) => s.select_path(id),
-                    Action::Drill(id) => s.drill(id),
+                    Action::Step(step) => s.step(step),
                     Action::Hover(id, from_chart) => {
                         s.hover = Some(id);
                         s.hover_from_chart = from_chart;
@@ -629,7 +655,9 @@ impl App {
         let allow_hidden = self.settings.allow_removing_hidden;
         let Some(s) = self.session() else { return };
         let tree = s.scan.tree.read();
-        let error = if kind == OpKind::Copy {
+        let error = if tree.unscanned(id) {
+            Some(CheckError::Unscanned)
+        } else if kind == OpKind::Copy {
             None
         } else if !allow_hidden && tree.in_hidden(id) {
             Some(CheckError::Hidden)
@@ -687,8 +715,26 @@ impl App {
                 self.actions.push(Action::CloseSearch);
             }
         }
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        // Arrow keys walk the outline columns; the side buttons of a mouse go back and forward.
+        let browsing = matches!(self.dialog, Dialog::None) && self.session().map(|s| s.tab == Tab::Outline && !s.search_open).unwrap_or(false);
+        if browsing {
+            let steps = [(Key::ArrowUp, Step::Up), (Key::ArrowDown, Step::Down), (Key::ArrowLeft, Step::Left), (Key::ArrowRight, Step::Right)];
+            for (key, step) in steps {
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key)) {
+                    self.actions.push(Action::Step(step));
+                }
+            }
+        }
+        for (button, cmd) in [(egui::PointerButton::Extra1, Cmd::GoBack), (egui::PointerButton::Extra2, Cmd::GoForward)] {
+            if ctx.input(|i| i.pointer.button_pressed(button)) {
+                self.actions.push(Action::Cmd(cmd));
+            }
+        }
         // On macOS the native menu bar owns the shortcuts.
-        if cfg!(target_os = "macos") || ctx.wants_keyboard_input() {
+        if cfg!(target_os = "macos") {
             return;
         }
         let table = [
@@ -701,6 +747,10 @@ impl App {
             (Modifiers::COMMAND, Key::F, Cmd::Find),
             (Modifiers::COMMAND, Key::Num1, Cmd::TabOutline),
             (Modifiers::COMMAND, Key::Num2, Cmd::TabBiggest),
+            (Modifiers::COMMAND, Key::OpenBracket, Cmd::GoBack),
+            (Modifiers::COMMAND, Key::CloseBracket, Cmd::GoForward),
+            (Modifiers::ALT, Key::ArrowLeft, Cmd::GoBack),
+            (Modifiers::ALT, Key::ArrowRight, Cmd::GoForward),
             (Modifiers::COMMAND, Key::ArrowUp, Cmd::GoParent),
             (Modifiers::COMMAND, Key::Backspace, Cmd::Remove),
             (Modifiers::COMMAND, Key::Comma, Cmd::Settings),
@@ -710,6 +760,34 @@ impl App {
             if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(mods, key))) {
                 self.actions.push(Action::Cmd(cmd));
             }
+        }
+    }
+
+    /// A sideways two-finger swipe on a trackpad goes back or forward.
+    fn handle_swipe(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let mut swiped = None;
+        // The outline columns scroll sideways; a swipe counts where they cannot move further.
+        let strip = crate::views::strip_scroll(ctx);
+        ctx.input(|i| {
+            let over = i.pointer.hover_pos().map(|p| strip.rect.contains(p)).unwrap_or(false);
+            let scrolls = |right: bool| over && if right { strip.offset > 0.5 } else { strip.offset < strip.end - 0.5 };
+            for e in &i.events {
+                if let egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, modifiers } = e {
+                    if modifiers.is_none() {
+                        self.trackpad_at = now;
+                        swiped = self.swipe.feed(now, delta.x, delta.y, scrolls).or(swiped);
+                    }
+                }
+            }
+        });
+        if now - self.trackpad_at < 0.3 && !self.swipe.scrolling() {
+            // Sideways travel of a swipe must not also scroll the columns,
+            // not even with what egui spreads over the next frames.
+            ctx.input_mut(|i| i.smooth_scroll_delta.x = 0.0);
+        }
+        if let Some(forward) = swiped {
+            self.actions.push(Action::Cmd(if forward { Cmd::GoForward } else { Cmd::GoBack }));
         }
     }
 
@@ -810,9 +888,17 @@ impl eframe::App for App {
         [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.frame += 1;
         self.sync_appearance(ctx);
+        // The system puts the window buttons back where it wants them on every resize.
+        #[cfg(target_os = "macos")]
+        {
+            let (x, y) = crate::views::window_buttons_at();
+            self.lights = platform::place_window_buttons(frame, x, y).unwrap_or(0.0);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
         #[cfg(target_os = "macos")]
         if let Some(menu) = &self.native_menu {
             for cmd in menu.poll() {
@@ -825,6 +911,7 @@ impl eframe::App for App {
             menu.sync(self.settings.sidebar_open, self.settings.show_chart);
         }
         self.handle_shortcuts(ctx);
+        self.handle_swipe(ctx);
         self.handle_drops(ctx);
         self.poll_operation();
 
@@ -846,6 +933,13 @@ impl eframe::App for App {
             } else {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
+        }
+
+        // The preview pane shows a thumbnail of the selected file.
+        self.thumbs.poll(ctx);
+        let previewed = self.session().and_then(|s| s.selected_file().map(|id| s.path_of(id)));
+        if let Some(path) = previewed.filter(|_| !self.opts.demo) {
+            self.thumbs.want(ctx, &path);
         }
 
         let mut actions = std::mem::take(&mut self.actions);

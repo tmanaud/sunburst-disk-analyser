@@ -1,7 +1,7 @@
 //! Remove (to the system Trash), move and copy of selected items.
 //!
-//! Nothing here ever overwrites an existing file or deletes permanently,
-//! except for the source of a cross-volume move after a complete copy.
+//! Nothing here ever overwrites an existing file, deletes permanently or
+//! falls back to copy-then-delete: a remove or a move is a rename, or fails.
 
 use crate::tree::NodeId;
 use parking_lot::Mutex;
@@ -10,6 +10,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(unix)]
+use crate::pinned::{cstr, set_mode, Dir, Kind, Stat};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OpKind {
@@ -24,7 +27,8 @@ pub struct OpItem {
     pub path: PathBuf,
     pub size: u64,
     pub is_dir: bool,
-    /// Identity recorded when the item was put up for review.
+    /// Identity recorded when the item was put up for review; none when it
+    /// no longer matched the scan, in which case it is not touched.
     pub ident: Option<Ident>,
 }
 
@@ -166,7 +170,7 @@ pub fn run(kind: OpKind, items: Vec<OpItem>, dest: Option<PathBuf>) -> Arc<OpPro
                 if p.cancel.load(Ordering::Acquire) {
                     break;
                 }
-                let outcome = run_one(kind, &item, dest.as_deref());
+                let outcome = run_one(kind, &item, dest.as_deref(), &p.cancel);
                 let (error, renamed) = match outcome {
                     Ok(r) => (None, r),
                     Err(e) => (Some(e), None),
@@ -180,95 +184,119 @@ pub fn run(kind: OpKind, items: Vec<OpItem>, dest: Option<PathBuf>) -> Arc<OpPro
     progress
 }
 
-fn run_one(kind: OpKind, item: &OpItem, dest: Option<&Path>) -> Result<Option<PathBuf>, String> {
-    // Time has passed since the review: the item must still be the same object.
-    let now = Ident::of(&item.path).ok_or("The item no longer exists")?;
-    if now.is_dir != item.is_dir || item.ident.map(|reviewed| reviewed != now).unwrap_or(false) {
+fn run_one(kind: OpKind, item: &OpItem, dest: Option<&Path>, cancel: &AtomicBool) -> Result<Option<PathBuf>, String> {
+    // Without a recorded identity nothing proves this is the reviewed item.
+    let reviewed = match item.ident {
+        Some(ident) => ident,
+        None if fs::symlink_metadata(&item.path).is_err() => return Err("The item no longer exists".into()),
+        None => return Err("The item changed since it was scanned: scan the folder again".into()),
+    };
+    if reviewed.is_dir != item.is_dir {
         return Err("The item changed since it was reviewed".into());
     }
-    match kind {
-        OpKind::Remove => {
-            if protected_reason(&item.path).is_some() {
-                return Err("This item is required by the system".into());
-            }
-            move_to_trash(&item.path)?;
-            Ok(None)
-        }
-        OpKind::Copy => {
-            let dest = dest.ok_or("No destination folder")?;
-            check_destination(&item.path, dest)?;
-            let staging = staging_path(&item.path, dest)?;
-            // `owned` tells whether the staging object was created by this copy;
-            // nothing else is ever cleaned up.
-            let mut owned = false;
-            if let Err(e) = copy_any(&item.path, &staging, Some(&mut owned)) {
-                if owned {
-                    let _ = remove_any(&staging);
-                }
-                return Err(e.to_string());
-            }
-            match publish(&staging, &item.path, dest) {
-                Ok((target, renamed)) => Ok(renamed.then_some(target)),
-                Err(e) => {
-                    let _ = remove_any(&staging);
-                    Err(e)
-                }
-            }
-        }
-        OpKind::Move => {
-            if protected_reason(&item.path).is_some() {
-                return Err("This item is required by the system".into());
-            }
-            let dest = dest.ok_or("No destination folder")?;
-            if item.path.parent() == Some(dest) {
-                return Err("The item is already in this folder".into());
-            }
-            check_destination(&item.path, dest)?;
-            // A move is a rename and nothing else: across volumes it would mean
-            // copy-then-delete, which cannot be made safe against files changing
-            // meanwhile, so that case is refused.
-            let (target, renamed) = publish(&item.path, &item.path, dest)?;
-            Ok(renamed.then_some(target))
-        }
+    if kind != OpKind::Copy && protected_reason(&item.path).is_some() {
+        return Err("This item is required by the system".into());
     }
+    if kind == OpKind::Remove {
+        // Time has passed since the review: the item must still be the same object.
+        move_to_trash(&Source::open(item, reviewed)?)?;
+        return Ok(None);
+    }
+    let dest = dest.ok_or("No destination folder")?;
+    if kind == OpKind::Move && item.path.parent() == Some(dest) {
+        return Err("The item is already in this folder".into());
+    }
+    check_destination(&item.path, dest)?;
+    let src = Source::open(item, reviewed)?;
+    // A move is a rename and nothing else: across volumes it would mean
+    // copy-then-delete, which cannot be made safe against files changing
+    // meanwhile, so that case is refused.
+    let (target, renamed) = if kind == OpKind::Move { src.move_into(dest)? } else { src.copy_into(dest, cancel)? };
+    Ok(renamed.then_some(target))
 }
 
 /// What identifies an item between the review and the operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Ident {
     pub is_dir: bool,
-    /// (device, inode) on Unix; (length, modification time) elsewhere.
-    key: (u64, u64),
+    /// Volume and file number, then length and modification time for a
+    /// file. A folder in use changes date all the time and stays the same
+    /// folder, so only what it is counts.
+    key: [u64; 4],
 }
 
 impl Ident {
+    fn new(is_dir: bool, volume: u64, file: u64, len: u64, mtime: u64) -> Ident {
+        Ident { is_dir, key: if is_dir { [volume, file, 0, 0] } else { [volume, file, len, mtime] } }
+    }
+
     pub fn of(path: &Path) -> Option<Ident> {
         let md = fs::symlink_metadata(path).ok()?;
         #[cfg(unix)]
-        let key = {
+        {
             use std::os::unix::fs::MetadataExt;
-            (md.dev(), md.ino())
-        };
-        #[cfg(not(unix))]
-        let key = {
+            Some(Ident::new(md.is_dir(), md.dev(), md.ino(), md.len(), nanos(md.mtime(), md.mtime_nsec())))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::AsRawHandle;
+            extern "system" {
+                fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut [u32; 13]) -> i32;
+            }
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            // No access is requested: only the handle's identity is read.
+            let file = fs::OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .ok()?;
+            // BY_HANDLE_FILE_INFORMATION: attributes, three times, volume
+            // serial number, size, link count, file index.
+            let mut info = [0u32; 13];
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+                return None;
+            }
+            let wide = |high: u32, low: u32| (high as u64) << 32 | low as u64;
+            Some(Ident::new(md.is_dir(), info[7] as u64, wide(info[11], info[12]), md.len(), wide(info[6], info[5])))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
-            (if md.is_dir() { 0 } else { md.len() }, mtime.unwrap_or(0))
-        };
-        Some(Ident { is_dir: md.is_dir(), key })
+            Some(Ident::new(md.is_dir(), 0, 0, md.len(), mtime.unwrap_or(0)))
+        }
+    }
+
+    #[cfg(unix)]
+    fn of_stat(st: &Stat) -> Ident {
+        Ident::new(st.kind == Kind::Dir, st.dev, st.ino, st.len, nanos(st.mtime, st.mtime_nsec))
     }
 }
 
-fn move_to_trash(path: &Path) -> Result<(), String> {
-    #[allow(unused_mut)]
-    let mut ctx = trash::TrashContext::default();
-    // The default method scripts Finder, which needs an Automation permission
-    // prompt; NSFileManager trashes directly.
-    #[cfg(target_os = "macos")]
-    {
-        use trash::macos::{DeleteMethod, TrashContextExtMacos};
-        ctx.set_delete_method(DeleteMethod::NsFileManager);
+#[cfg(unix)]
+fn nanos(secs: i64, nsec: i64) -> u64 {
+    (secs as u64).wrapping_mul(1_000_000_000).wrapping_add(nsec as u64)
+}
+
+/// Whether the item on disk is still the one the scan recorded: a file with
+/// the same date, or the same folder (`dir_id` is its scan-time device and
+/// inode, where known).
+pub fn unchanged_since_scan(path: &Path, is_dir: bool, mtime: i64, dir_id: Option<(u64, u64)>) -> bool {
+    let Ok(md) = fs::symlink_metadata(path) else { return false };
+    if md.is_dir() != is_dir {
+        return false;
     }
-    ctx.delete(path).map_err(|e| e.to_string())
+    if !is_dir {
+        return crate::scan::mtime_of(&md) == mtime;
+    }
+    #[cfg(unix)]
+    if let Some(id) = dir_id {
+        use std::os::unix::fs::MetadataExt;
+        return (md.dev(), md.ino()) == id;
+    }
+    let _ = dir_id;
+    true
 }
 
 fn check_destination(src: &Path, dest: &Path) -> Result<(), String> {
@@ -283,15 +311,6 @@ fn check_destination(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A name in `dest` that no other program will plausibly use.
-fn staging_path(src: &Path, dest: &Path) -> Result<PathBuf, String> {
-    let name = src.file_name().ok_or("Invalid item name")?;
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-    let mut staged = std::ffi::OsString::from(format!(".sunburst-copy-{}-{nanos}-", std::process::id()));
-    staged.push(name);
-    Ok(dest.join(staged))
-}
-
 /// The n-th candidate name for `src` in `dest`: "name", "name (2)", "name (3)"…
 fn candidate(src: &Path, dest: &Path, n: u32) -> Result<PathBuf, String> {
     let name = src.file_name().ok_or("Invalid item name")?;
@@ -304,84 +323,413 @@ fn candidate(src: &Path, dest: &Path, n: u32) -> Result<PathBuf, String> {
     Ok(dest.join(format!("{stem} ({n}){ext}")))
 }
 
-/// Renames `from` to a free name in `dest` without ever replacing anything.
-/// Returns the final path and whether a numbered name had to be used.
-fn publish(from: &Path, named_like: &Path, dest: &Path) -> Result<(PathBuf, bool), String> {
+const CROSS_VOLUME: &str = "The destination is on another volume: copy the item, check the copy, then remove the original";
+
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "Stopped before the item was fully copied")
+}
+
+/// Copies the content of one file, giving up as soon as Stop is pressed.
+fn copy_bytes(input: &mut impl io::Read, output: &mut impl io::Write, cancel: &AtomicBool) -> io::Result<()> {
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(stopped());
+        }
+        match input.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => output.write_all(&buf[..n])?,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+// ---- macOS and Linux: every access goes through directory handles ---------
+
+/// The reviewed item, pinned: its folder is open and the entry was checked
+/// against the reviewed identity through that handle.
+#[cfg(unix)]
+struct Source<'a> {
+    path: &'a Path,
+    dir: Dir,
+    name: std::ffi::CString,
+    stat: Stat,
+}
+
+#[cfg(unix)]
+impl<'a> Source<'a> {
+    fn open(item: &'a OpItem, reviewed: Ident) -> Result<Self, String> {
+        let gone = |_| String::from("The item no longer exists");
+        let (parent, name) = item.path.parent().zip(item.path.file_name()).ok_or("Invalid item name")?;
+        let dir = Dir::open(parent).map_err(gone)?;
+        let name = cstr(name).map_err(|e| e.to_string())?;
+        let stat = dir.stat(&name).map_err(gone)?;
+        if Ident::of_stat(&stat) != reviewed {
+            return Err("The item changed since it was reviewed".into());
+        }
+        // The scan does not look inside other volumes, so their content was
+        // never reviewed.
+        if stat.kind == Kind::Dir && dir.stat_self().map(|d| d.dev != stat.dev).unwrap_or(true) {
+            return Err("This item is another volume and cannot be handled from here".into());
+        }
+        Ok(Source { path: &item.path, dir, name, stat })
+    }
+
+    fn move_into(&self, dest: &Path) -> Result<(PathBuf, bool), String> {
+        publish(&self.dir, &self.name, &open_destination(dest)?, self.path, dest)
+    }
+
+    fn copy_into(&self, dest: &Path, cancel: &AtomicBool) -> Result<(PathBuf, bool), String> {
+        let to = open_destination(dest)?;
+        raise_open_files_limit();
+        let staging = Staging::create(&to).map_err(|e| e.to_string())?;
+        let result = copy_tree(self, &staging, cancel)
+            .map_err(|e| e.to_string())
+            .and_then(|()| publish(&staging.dir, &self.name, &to, self.path, dest));
+        staging.discard(&to);
+        result
+    }
+}
+
+#[cfg(unix)]
+fn open_destination(dest: &Path) -> Result<Dir, String> {
+    Dir::open(dest).map_err(|_| "The destination folder does not exist".into())
+}
+
+/// A copy keeps one handle per folder level open.
+#[cfg(unix)]
+fn raise_open_files_limit() {
+    unsafe {
+        let mut limit = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            let wanted = limit.rlim_max.min(8192);
+            if limit.rlim_cur < wanted {
+                limit.rlim_cur = wanted;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+    }
+}
+
+/// Private folder in the destination where a copy is built before it is
+/// renamed to its final name, so nobody else can read it meanwhile.
+#[cfg(unix)]
+struct Staging {
+    name: std::ffi::CString,
+    dir: Dir,
+    id: (u64, u64),
+}
+
+#[cfg(unix)]
+impl Staging {
+    fn create(dest: &Dir) -> io::Result<Staging> {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let name = std::ffi::CString::new(format!(".sunburst-copy-{}-{nanos}", std::process::id())).expect("no NUL");
+        dest.create_dir(&name)?;
+        let dir = dest.open_dir(&name)?;
+        let st = dir.stat_self()?;
+        // Where others may write to the destination, the folder that was just
+        // opened must be the one created above and not somebody else's.
+        let shared = dest.stat_self()?.mode & 0o022 != 0;
+        if shared && st.uid != unsafe { libc::geteuid() } {
+            return Err(io::Error::other("The destination folder changed during the copy"));
+        }
+        Ok(Staging { name, dir, id: (st.dev, st.ino) })
+    }
+
+    /// Deletes whatever was not published, through the handle: only objects
+    /// created by this copy can be reached that way.
+    fn discard(self, dest: &Dir) {
+        let _ = self.dir.clear();
+        let _ = dest.unlink(&self.name, true);
+    }
+}
+
+#[cfg(unix)]
+fn publish(from: &Dir, name: &std::ffi::CStr, to: &Dir, named_like: &Path, dest: &Path) -> Result<(PathBuf, bool), String> {
     for n in 1..10_000 {
         let target = candidate(named_like, dest, n)?;
-        match rename_noreplace(from, &target) {
+        let target_name = target.file_name().map(cstr).ok_or("Invalid item name")?.map_err(|e| e.to_string())?;
+        match from.rename_excl(name, to, &target_name) {
             Ok(()) => return Ok((target, n > 1)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) if is_cross_device(&e) => {
-                return Err("The destination is on another volume: copy the item, check the copy, then remove the original".into())
-            }
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => return Err(CROSS_VOLUME.into()),
             Err(e) => return Err(e.to_string()),
         }
     }
     Err("Could not find a free name in the destination".into())
 }
 
-fn is_cross_device(e: &io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        e.raw_os_error() == Some(libc::EXDEV)
+/// Copies the item into the staging folder. Folders are walked with an
+/// explicit stack, entries are opened relative to their folder's handle and
+/// never through a link, and the copy stays on the item's volume.
+#[cfg(unix)]
+fn copy_tree(src: &Source, staging: &Staging, cancel: &AtomicBool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    struct Frame {
+        src: Dir,
+        dst: Dir,
+        names: Vec<std::ffi::CString>,
+        mode: u32,
     }
-    #[cfg(windows)]
-    {
-        e.raw_os_error() == Some(17) // ERROR_NOT_SAME_DEVICE
+    let changed = || io::Error::other("An item changed while it was being copied");
+    let entry = |from: &Dir, to: &Dir, name: &std::ffi::CStr, st: Stat| -> io::Result<Option<Frame>> {
+        let shown = || name.to_string_lossy().into_owned();
+        match st.kind {
+            Kind::Symlink => to.symlink(&from.read_link(name)?, name).map(|()| None),
+            Kind::Dir => {
+                if st.dev != src.stat.dev {
+                    return Err(io::Error::other(format!("{} is another volume, which the scan did not look into", shown())));
+                }
+                if (st.dev, st.ino) == staging.id {
+                    return Err(io::Error::other("The destination is inside the item"));
+                }
+                let from = from.open_dir(name)?;
+                let opened = from.stat_self()?;
+                if (opened.dev, opened.ino) != (st.dev, st.ino) {
+                    return Err(changed());
+                }
+                to.create_dir(name)?;
+                let to = to.open_dir(name)?;
+                let (names, complete) = from.names(usize::MAX, &|| cancel.load(Ordering::Acquire))?;
+                if !complete {
+                    return Err(if cancel.load(Ordering::Acquire) { stopped() } else { changed() });
+                }
+                Ok(Some(Frame { src: from, dst: to, names, mode: st.mode }))
+            }
+            Kind::File => {
+                let mut input = from.open_file(name)?;
+                let opened = Stat::of_file(&input)?;
+                if opened.kind != Kind::File || (opened.dev, opened.ino) != (st.dev, st.ino) {
+                    return Err(changed());
+                }
+                let mut output = to.create_file(name)?;
+                copy_bytes(&mut input, &mut output, cancel)?;
+                set_mode(output.as_raw_fd(), st.mode)?;
+                if let Ok(t) = input.metadata().and_then(|m| m.modified()) {
+                    let _ = output.set_modified(t);
+                }
+                Ok(None)
+            }
+            // Sockets, devices and pipes cannot be copied.
+            Kind::Other => Err(io::Error::new(io::ErrorKind::Unsupported, format!("{} is a special file", shown()))),
+        }
+    };
+    let mut stack: Vec<Frame> = Vec::new();
+    stack.extend(entry(&src.dir, &staging.dir, &src.name, src.stat)?);
+    while let Some(top) = stack.last_mut() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(stopped());
+        }
+        match top.names.pop() {
+            Some(name) => {
+                let st = top.src.stat(&name)?;
+                let sub = entry(&top.src, &top.dst, &name, st)?;
+                stack.extend(sub);
+            }
+            None => {
+                let done = stack.pop().expect("frame");
+                set_mode(done.dst.as_raw_fd(), done.mode)?;
+            }
+        }
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = e;
-        false
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn move_to_trash(src: &Source) -> Result<(), String> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut ctx = trash::TrashContext::default();
+    // The default method scripts Finder, which needs an Automation permission
+    // prompt; NSFileManager trashes directly.
+    ctx.set_delete_method(DeleteMethod::NsFileManager);
+    ctx.delete(src.path).map_err(|e| e.to_string())
+}
+
+/// Trashing is a rename into a trash folder of the item's own volume. Where
+/// no such folder can be used the item stays in place: copying it to another
+/// volume and deleting the original would not be a safe substitute.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn move_to_trash(src: &Source) -> Result<(), String> {
+    let gone = "The item no longer exists";
+    let parent = src.path.parent().and_then(|p| fs::canonicalize(p).ok()).ok_or(gone)?;
+    let real = parent.join(src.path.file_name().ok_or(gone)?);
+    let device = src.dir.stat_self().map_err(|e| e.to_string())?.dev;
+    let mut why = String::from("none found");
+    for (trash, top) in xdg_trash::candidates(&parent, device) {
+        let recorded = top.as_deref().and_then(|t| real.strip_prefix(t).ok()).unwrap_or(&real);
+        match xdg_trash::put(&src.dir, &src.name, &trash, recorded) {
+            Ok(()) => return Ok(()),
+            Err(e) => why = e.to_string(),
+        }
     }
+    Err(format!("This volume has no usable Trash, so the item was left in place ({why})"))
+}
+
+/// FreeDesktop.org trash folders, written to with renames only.
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+mod xdg_trash {
+    use crate::pinned::{cstr, Dir};
+    use std::ffi::{CStr, OsStr};
+    use std::io::{self, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::{Path, PathBuf};
+
+    /// Trash folders that may take an item living in `parent` (a resolved
+    /// path on `device`), best first, each with the volume root its recorded
+    /// paths are relative to (none for the home trash).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn candidates(parent: &Path, device: u64) -> Vec<(PathBuf, Option<PathBuf>)> {
+        let uid = unsafe { libc::geteuid() };
+        let mut found = Vec::new();
+        if let Some(data) = dirs::data_dir() {
+            if data.ancestors().find_map(|a| std::fs::metadata(a).ok()).map(|m| m.dev()) == Some(device) {
+                found.push((data.join("Trash"), None));
+            }
+        }
+        let mut top = parent;
+        for ancestor in parent.ancestors().skip(1) {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(m) if m.dev() == device => top = ancestor,
+                _ => break,
+            }
+        }
+        // A shared `.Trash` must be a real folder with the sticky bit.
+        let shared = top.join(".Trash");
+        if std::fs::symlink_metadata(&shared).map(|m| m.is_dir() && m.mode() & 0o1000 != 0).unwrap_or(false) {
+            found.push((shared.join(uid.to_string()), Some(top.to_path_buf())));
+        }
+        found.push((top.join(format!(".Trash-{uid}")), Some(top.to_path_buf())));
+        found
+    }
+
+    /// Moves `name` out of `src` into the trash folder `trash`. `recorded`
+    /// is the original location kept for restoring.
+    pub fn put(src: &Dir, name: &CStr, trash: &Path, recorded: &Path) -> io::Result<()> {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(trash.join("files"))?;
+        builder.create(trash.join("info"))?;
+        let files = Dir::open_nofollow(&trash.join("files"))?;
+        let info = Dir::open_nofollow(&trash.join("info"))?;
+        let original = Path::new(OsStr::from_bytes(name.to_bytes()));
+        for n in 1..10_000 {
+            let kept = super::candidate(original, Path::new(""), n).map_err(io::Error::other)?.into_os_string();
+            let mut info_name = kept.clone();
+            info_name.push(".trashinfo");
+            let (kept, info_name) = (cstr(&kept)?, cstr(&info_name)?);
+            // The info file comes first and reserves the name.
+            let mut file = match info.create_file(&info_name) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            };
+            let date = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+            let moved = write!(file, "[Trash Info]\nPath={}\nDeletionDate={date}\n", encode(recorded))
+                .and_then(|()| src.rename_excl(name, &files, &kept));
+            match moved {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let _ = info.unlink(&info_name, false);
+                    if e.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Err(io::Error::other("Could not find a free name in the Trash"))
+    }
+
+    fn encode(path: &Path) -> String {
+        let mut out = String::new();
+        for &b in path.as_os_str().as_bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+}
+
+// ---- other systems: paths, checked right before use -----------------------
+
+#[cfg(not(unix))]
+struct Source<'a> {
+    path: &'a Path,
+}
+
+#[cfg(not(unix))]
+impl<'a> Source<'a> {
+    fn open(item: &'a OpItem, reviewed: Ident) -> Result<Self, String> {
+        let now = Ident::of(&item.path).ok_or("The item no longer exists")?;
+        if now != reviewed {
+            return Err("The item changed since it was reviewed".into());
+        }
+        Ok(Source { path: &item.path })
+    }
+
+    fn move_into(&self, dest: &Path) -> Result<(PathBuf, bool), String> {
+        publish(self.path, self.path, dest)
+    }
+
+    fn copy_into(&self, dest: &Path, cancel: &AtomicBool) -> Result<(PathBuf, bool), String> {
+        let name = self.path.file_name().ok_or("Invalid item name")?;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        // A name in `dest` that no other program will plausibly use.
+        let mut staged = std::ffi::OsString::from(format!(".sunburst-copy-{}-{nanos}-", std::process::id()));
+        staged.push(name);
+        let staging = dest.join(staged);
+        // `owned` tells whether the staging object was created by this copy;
+        // nothing else is ever cleaned up.
+        let mut owned = false;
+        let result = copy_any(self.path, &staging, &mut owned, cancel).map_err(|e| e.to_string()).and_then(|()| publish(&staging, self.path, dest));
+        if result.is_err() && owned {
+            let _ = remove_any(&staging);
+        }
+        result
+    }
+}
+
+/// Renames `from` to a free name in `dest` without ever replacing anything.
+/// Returns the final path and whether a numbered name had to be used.
+#[cfg(not(unix))]
+fn publish(from: &Path, named_like: &Path, dest: &Path) -> Result<(PathBuf, bool), String> {
+    for n in 1..10_000 {
+        let target = candidate(named_like, dest, n)?;
+        match rename_noreplace(from, &target) {
+            Ok(()) => return Ok((target, n > 1)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            // ERROR_NOT_SAME_DEVICE
+            Err(e) if cfg!(windows) && e.raw_os_error() == Some(17) => return Err(CROSS_VOLUME.into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("Could not find a free name in the destination".into())
 }
 
 /// Atomic rename that fails with `AlreadyExists` instead of replacing `to`.
+#[cfg(windows)]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
-        let (cf, ct) = (c(from)?, c(to)?);
-        #[cfg(target_os = "macos")]
-        let rc = unsafe { libc::renamex_np(cf.as_ptr(), ct.as_ptr(), libc::RENAME_EXCL) };
-        #[cfg(target_os = "linux")]
-        let rc = unsafe { libc::renameat2(libc::AT_FDCWD, cf.as_ptr(), libc::AT_FDCWD, ct.as_ptr(), libc::RENAME_NOREPLACE) };
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            // The file system has no exclusive rename (FAT, some network
-            // shares): check, then rename. A narrow race remains there.
-            Some(libc::ENOTSUP) | Some(libc::EINVAL) | Some(libc::ENOSYS) => rename_checked(from, to),
-            _ => Err(err),
-        }
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        extern "system" {
-            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-        }
-        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
-        let (wf, wt) = (wide(from), wide(to));
-        // No MOVEFILE_REPLACE_EXISTING and no MOVEFILE_COPY_ALLOWED.
-        if unsafe { MoveFileExW(wf.as_ptr(), wt.as_ptr(), 0) } != 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        rename_checked(from, to)
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let (wf, wt) = (wide(from), wide(to));
+    // No MOVEFILE_REPLACE_EXISTING and no MOVEFILE_COPY_ALLOWED.
+    if unsafe { MoveFileExW(wf.as_ptr(), wt.as_ptr(), 0) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
-#[cfg(not(windows))]
-fn rename_checked(from: &Path, to: &Path) -> io::Result<()> {
+#[cfg(not(any(unix, windows)))]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     match fs::symlink_metadata(to) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(from, to),
         Err(e) => Err(e),
@@ -391,47 +739,52 @@ fn rename_checked(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Copies `src` to `dst`, which must not exist. `owned` is set as soon as the
 /// top-level object has been created by this call.
-fn copy_any(src: &Path, dst: &Path, mut owned: Option<&mut bool>) -> io::Result<()> {
-    let mut created = || {
-        if let Some(flag) = owned.as_deref_mut() {
-            *flag = true;
+#[cfg(not(unix))]
+fn copy_any(src: &Path, dst: &Path, owned: &mut bool, cancel: &AtomicBool) -> io::Result<()> {
+    // Folders being copied: what is left to read and the permissions to set
+    // once the folder is complete.
+    let mut stack: Vec<(fs::ReadDir, PathBuf, fs::Permissions)> = Vec::new();
+    let mut next = Some((src.to_path_buf(), dst.to_path_buf()));
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(stopped());
         }
-    };
-    let md = fs::symlink_metadata(src)?;
-    let ft = md.file_type();
-    if ft.is_symlink() {
-        copy_symlink(src, dst)?;
-        created();
-        Ok(())
-    } else if ft.is_dir() {
-        fs::create_dir(dst)?;
-        created();
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_any(&entry.path(), &dst.join(entry.file_name()), None)?;
+        if let Some((from, to)) = next.take() {
+            let md = fs::symlink_metadata(&from)?;
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                copy_symlink(&from, &to)?;
+                *owned = true;
+            } else if ft.is_dir() {
+                fs::create_dir(&to)?;
+                *owned = true;
+                stack.push((fs::read_dir(&from)?, to, md.permissions()));
+            } else if ft.is_file() {
+                // `create_new` guarantees an existing file is never overwritten.
+                let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&to)?;
+                *owned = true;
+                let mut input = fs::File::open(&from)?;
+                copy_bytes(&mut input, &mut output, cancel)?;
+                let _ = fs::set_permissions(&to, md.permissions());
+                if let Ok(t) = md.modified() {
+                    let _ = output.set_modified(t);
+                }
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, format!("{} is a special file", from.display())));
+            }
         }
-        let _ = fs::set_permissions(dst, md.permissions());
-        Ok(())
-    } else if ft.is_file() {
-        // `create_new` guarantees an existing file is never overwritten.
-        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
-        created();
-        let mut input = fs::File::open(src)?;
-        io::copy(&mut input, &mut output)?;
-        let _ = fs::set_permissions(dst, md.permissions());
-        if let Ok(t) = md.modified() {
-            let _ = output.set_modified(t);
+        let Some((entries, to, permissions)) = stack.last_mut() else { return Ok(()) };
+        match entries.next() {
+            Some(entry) => {
+                let entry = entry?;
+                next = Some((entry.path(), to.join(entry.file_name())));
+            }
+            None => {
+                let _ = fs::set_permissions(&*to, permissions.clone());
+                stack.pop();
+            }
         }
-        Ok(())
-    } else {
-        // Sockets, devices and pipes cannot be copied.
-        Err(io::Error::new(io::ErrorKind::Unsupported, format!("{} is a special file", src.display())))
     }
-}
-
-#[cfg(unix)]
-fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(fs::read_link(src)?, dst)
 }
 
 #[cfg(windows)]
@@ -444,7 +797,13 @@ fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, format!("{} is a link", src.display())))
+}
+
 /// Removes a staging object this module created itself.
+#[cfg(not(unix))]
 fn remove_any(p: &Path) -> io::Result<()> {
     let md = fs::symlink_metadata(p)?;
     if md.is_dir() {
@@ -452,6 +811,34 @@ fn remove_any(p: &Path) -> io::Result<()> {
     } else {
         fs::remove_file(p)
     }
+}
+
+/// Whether Windows has a Recycle Bin for the item: only internal drives do.
+/// Elsewhere (network shares, memory sticks) it deletes for good.
+#[cfg(windows)]
+fn has_recycle_bin(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDriveTypeW(root: *const u16) -> u32;
+    }
+    const DRIVE_FIXED: u32 = 3;
+    let real = resolved(path);
+    let Some(root) = real.ancestors().last() else { return false };
+    let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+    if wide.last() != Some(&(b'\\' as u16)) {
+        wide.push(b'\\' as u16);
+    }
+    wide.push(0);
+    unsafe { GetDriveTypeW(wide.as_ptr()) == DRIVE_FIXED }
+}
+
+#[cfg(not(unix))]
+fn move_to_trash(src: &Source) -> Result<(), String> {
+    #[cfg(windows)]
+    if !has_recycle_bin(src.path) {
+        return Err("This drive has no Recycle Bin: the item would be deleted for good, so it was left in place".into());
+    }
+    trash::TrashContext::default().delete(src.path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -518,11 +905,85 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let p = run(OpKind::Move, vec![reviewed], Some(dst.clone()));
         wait(&p);
-        let changed = Ident::of(&src.join("file.txt"));
-        if changed != p.results.lock()[0].item.ident {
-            assert!(p.results.lock()[0].error.is_some());
-            assert!(src.join("file.txt").exists());
+        assert!(p.results.lock()[0].error.is_some());
+        assert_eq!(fs::read(src.join("file.txt")).unwrap(), b"a different file, longer than before");
+    }
+
+    #[test]
+    fn an_item_that_no_longer_matches_the_scan_is_refused() {
+        let (_d, src, dst) = fixture();
+        let scanned = crate::scan::mtime_of(&fs::symlink_metadata(src.join("file.txt")).unwrap());
+        assert!(unchanged_since_scan(&src.join("file.txt"), false, scanned, None));
+        assert!(!unchanged_since_scan(&src.join("file.txt"), true, scanned, None));
+        assert!(!unchanged_since_scan(&src.join("file.txt"), false, scanned - 100, None));
+        // A folder in use keeps changing date and is still the same folder;
+        // another folder under its name is not.
+        assert!(unchanged_since_scan(&src.join("folder"), true, 0, None));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let md = fs::metadata(src.join("folder")).unwrap();
+            assert!(unchanged_since_scan(&src.join("folder"), true, 0, Some((md.dev(), md.ino()))));
+            assert!(!unchanged_since_scan(&src.join("folder"), true, 0, Some((md.dev(), md.ino() + 1))));
         }
+        // The session gives such an item no identity.
+        let mut stale = item(src.join("folder"));
+        stale.ident = None;
+        for kind in [OpKind::Remove, OpKind::Move, OpKind::Copy] {
+            let p = run(kind, vec![stale.clone()], Some(dst.clone()));
+            wait(&p);
+            assert!(p.results.lock()[0].error.as_deref().unwrap().contains("scan"), "{kind:?}");
+        }
+        assert!(src.join("folder/a.txt").exists());
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_keeps_private_files_private_and_links_as_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, src, dst) = fixture();
+        fs::write(dir.path().join("outside.txt"), b"outside").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside.txt"), src.join("folder/link")).unwrap();
+        fs::set_permissions(src.join("folder/a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(src.join("folder/sub"), fs::Permissions::from_mode(0o750)).unwrap();
+        let p = run(OpKind::Copy, vec![item(src.join("folder"))], Some(dst.clone()));
+        wait(&p);
+        assert!(p.results.lock()[0].error.is_none(), "{:?}", p.results.lock()[0].error);
+        let mode = |p: &str| fs::symlink_metadata(dst.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode("folder/a.txt"), mode("folder/sub")), (0o600, 0o750));
+        assert_eq!(fs::read_link(dst.join("folder/link")).unwrap(), dir.path().join("outside.txt"));
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 1, "the staging folder is gone");
+    }
+
+    #[test]
+    fn a_stopped_copy_leaves_nothing_behind() {
+        let (_d, src, dst) = fixture();
+        let stop = AtomicBool::new(true);
+        assert!(run_one(OpKind::Copy, &item(src.join("folder")), Some(&dst), &stop).is_err());
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
+        assert!(src.join("folder/sub/b.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trashing_is_a_rename_that_never_replaces() {
+        let (dir, src, _dst) = fixture();
+        let trash = dir.path().join("Trash");
+        let from = Dir::open(&src).unwrap();
+        for (name, recorded) in [("file.txt", "/somewhere/file.txt"), ("folder", "rel ative/folder")] {
+            xdg_trash::put(&from, &cstr(name.as_ref()).unwrap(), &trash, Path::new(recorded)).unwrap();
+            assert!(!src.join(name).exists());
+        }
+        assert_eq!(fs::read(trash.join("files/folder/sub/b.txt")).unwrap(), b"beta");
+        let info = fs::read_to_string(trash.join("info/folder.trashinfo")).unwrap();
+        assert!(info.starts_with("[Trash Info]\nPath=rel%20ative/folder\nDeletionDate=2"), "{info}");
+        // A second item of the same name gets a numbered one.
+        fs::write(src.join("file.txt"), b"two").unwrap();
+        xdg_trash::put(&from, &cstr("file.txt".as_ref()).unwrap(), &trash, Path::new("/somewhere/file.txt")).unwrap();
+        assert_eq!(fs::read(trash.join("files/file.txt")).unwrap(), b"one");
+        assert_eq!(fs::read(trash.join("files/file (2).txt")).unwrap(), b"two");
+        assert!(trash.join("info/file (2).txt.trashinfo").exists());
     }
 
     #[test]
@@ -598,6 +1059,36 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         assert!(protected_reason(Path::new("/usr/lib/x")).is_some());
+    }
+
+    /// Removal on volumes other than the home one; run explicitly on Linux
+    /// with `NO_TRASH_DIR` set to a writable folder of a volume whose root is
+    /// not writable, and `VOLUME_TRASH_DIR` to a folder of one whose root is.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    #[ignore]
+    fn remove_never_copies_across_volumes() {
+        let remove = |dir: &str| {
+            let target = PathBuf::from(dir).join("victim.txt");
+            fs::write(&target, b"keep me").unwrap();
+            let p = run(OpKind::Remove, vec![item(target.clone())], None);
+            wait(&p);
+            let error = p.results.lock()[0].error.clone();
+            (target, error)
+        };
+        if let Ok(dir) = std::env::var("NO_TRASH_DIR") {
+            let (target, error) = remove(&dir);
+            assert!(error.as_deref().unwrap().contains("no usable Trash"), "{error:?}");
+            assert_eq!(fs::read(target).unwrap(), b"keep me");
+        }
+        if let Ok(dir) = std::env::var("VOLUME_TRASH_DIR") {
+            let (target, error) = remove(&dir);
+            assert!(error.is_none(), "{error:?}");
+            assert!(!target.exists());
+            let uid = unsafe { libc::geteuid() };
+            let trashed = PathBuf::from(&dir).join(format!(".Trash-{uid}/files/victim.txt"));
+            assert_eq!(fs::read(trashed).unwrap(), b"keep me");
+        }
     }
 
     /// Moves one tiny temp file to the real system Trash; run explicitly.

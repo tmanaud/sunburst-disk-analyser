@@ -187,8 +187,18 @@ pub fn quick_look(path: &Path) {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // Opening a launcher runs the command written in it: show it instead.
+        if cfg!(unix) && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("desktop")) {
+            reveal(path);
+            return;
+        }
         let _ = open::that_detached(path);
     }
+}
+
+/// Opens the item with the application the system associates with it.
+pub fn open_file(path: &Path) {
+    let _ = open::that_detached(path);
 }
 
 pub fn preview_label() -> &'static str {
@@ -222,4 +232,98 @@ fn secs(t: std::io::Result<std::time::SystemTime>) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Moves the close, minimise and zoom buttons of the window so that they start
+/// at `left` and are centred on `centre_y`, both in points from the top-left
+/// corner. Returns their right edge, or `None` when the window shows none
+/// (full screen). The system resets them on every resize: call this each frame.
+#[cfg(target_os = "macos")]
+pub fn place_window_buttons(frame: &eframe::Frame, left: f32, centre_y: f32) -> Option<f32> {
+    use objc2::encode::{Encode, Encoding};
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Size {
+        w: f64,
+        h: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        origin: Point,
+        size: Size,
+    }
+    unsafe impl Encode for Point {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for Size {
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for Rect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[Point::ENCODING, Size::ENCODING]);
+    }
+    const FULL_SCREEN: usize = 1 << 14;
+
+    let RawWindowHandle::AppKit(handle) = frame.window_handle().ok()?.as_raw() else { return None };
+    let view = handle.ns_view.as_ptr() as *mut AnyObject;
+    // SAFETY: the view belongs to the live window of this frame, `update` runs on the
+    // main thread, and every object is checked for nil before it receives a message.
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        if window.is_null() {
+            return None;
+        }
+        let style: usize = msg_send![window, styleMask];
+        if style & FULL_SCREEN != 0 {
+            return None;
+        }
+        let mut buttons = [std::ptr::null_mut::<AnyObject>(); 3];
+        for (kind, button) in buttons.iter_mut().enumerate() {
+            *button = msg_send![window, standardWindowButton: kind];
+            if button.is_null() {
+                return None;
+            }
+        }
+        let bar: *mut AnyObject = msg_send![buttons[0], superview];
+        if bar.is_null() {
+            return None;
+        }
+        let container: *mut AnyObject = msg_send![bar, superview];
+        if container.is_null() {
+            return None;
+        }
+        // Where the buttons are now, in window coordinates (origin at the bottom left).
+        let nowhere = std::ptr::null::<AnyObject>();
+        let outer: Rect = msg_send![window, frame];
+        let bounds: Rect = msg_send![buttons[0], bounds];
+        let seen: Rect = msg_send![buttons[0], convertRect: bounds, toView: nowhere];
+        // The whole title bar moves down with them, so that they stay inside it.
+        let down = centre_y as f64 - (outer.size.h - seen.origin.y - seen.size.h * 0.5);
+        if down.abs() > 0.5 {
+            let mut area: Rect = msg_send![container, frame];
+            area.origin.y -= down;
+            let _: () = msg_send![container, setFrame: area];
+        }
+        let right = left as f64 - seen.origin.x;
+        let first: Rect = msg_send![buttons[0], frame];
+        let second: Rect = msg_send![buttons[1], frame];
+        let step = second.origin.x - first.origin.x;
+        if right.abs() > 0.5 {
+            for button in buttons {
+                let at: Rect = msg_send![button, frame];
+                let _: () = msg_send![button, setFrameOrigin: Point { x: at.origin.x + right, y: at.origin.y }];
+            }
+        }
+        Some((left as f64 + step * 2.0 + first.size.w) as f32)
+    }
 }

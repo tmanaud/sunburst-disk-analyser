@@ -4,6 +4,8 @@
 //! their entries to the shared [`Tree`] one directory at a time, so the UI can
 //! show results while the scan is still running.
 
+#[cfg(unix)]
+use crate::pinned::{Dir, Kind};
 use crate::tree::*;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashSet;
@@ -52,9 +54,12 @@ impl ScanHandle {
     }
 }
 
+/// A folder to read, with the (device, inode) its parent listed it under.
+type Job = (NodeId, PathBuf, Option<(u64, u64)>);
+
 struct Shared {
     tree: Arc<RwLock<Tree>>,
-    queue: Mutex<Vec<(NodeId, PathBuf)>>,
+    queue: Mutex<Vec<Job>>,
     cv: Condvar,
     /// Directories queued or being processed.
     pending: AtomicUsize,
@@ -63,6 +68,9 @@ struct Shared {
     /// (device, inode) of multiply linked files already counted.
     #[cfg_attr(not(unix), allow(dead_code))]
     links: Mutex<HashSet<(u64, u64)>>,
+    /// (device, inode) of the folders already queued.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    dirs: Mutex<HashSet<(u64, u64)>>,
     policy: Policy,
 }
 
@@ -115,12 +123,13 @@ pub fn start_scan(root: PathBuf) -> ScanHandle {
 
     let shared = Arc::new(Shared {
         tree: tree.clone(),
-        queue: Mutex::new(vec![(0, root.clone())]),
+        queue: Mutex::new(vec![(0, root.clone(), None)]),
         cv: Condvar::new(),
         pending: AtomicUsize::new(1),
         cancel: cancel.clone(),
         entries: entries.clone(),
         links: Mutex::new(HashSet::new()),
+        dirs: Mutex::new(HashSet::new()),
         policy: Policy::for_root(&root),
     });
 
@@ -168,117 +177,190 @@ fn worker(s: &Shared) {
                 s.cv.wait_for(&mut q, Duration::from_millis(50));
             }
         };
-        scan_dir(s, job.0, &job.1);
+        scan_dir(s, job.0, &job.1, job.2);
         if s.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             s.cv.notify_all();
         }
     }
 }
 
-fn scan_dir(s: &Shared, id: NodeId, path: &Path) {
-    let rd = match fs::read_dir(path) {
-        Ok(rd) => rd,
-        Err(_) => {
-            s.tree.write().mark_denied(id);
-            return;
+/// A folder with more entries than this is reported as partly unread
+/// instead of being held in memory whole.
+const MAX_FOLDER_ENTRIES: usize = 4_000_000;
+
+/// One folder entry, read without following links.
+struct Found {
+    name: std::ffi::OsString,
+    is_dir: bool,
+    is_symlink: bool,
+    /// Space allocated on disk.
+    size: u64,
+    mtime: i64,
+    /// Hidden by a file attribute rather than by its name.
+    hidden: bool,
+    /// (device, inode) where the system has them.
+    id: (u64, u64),
+    links: u64,
+}
+
+/// Reads a folder: its entries and whether all of them could be read. `None`
+/// when it cannot be opened, or is no longer the folder that was queued.
+#[cfg(unix)]
+fn list(s: &Shared, path: &Path, expected: Option<(u64, u64)>) -> Option<(Vec<Found>, bool)> {
+    use std::os::unix::ffi::OsStringExt;
+    let stop = || s.cancel.load(Ordering::Acquire);
+    // The scanned location itself may be a link. Anything below must be the
+    // very folder its parent listed: a folder swapped for a link, or for
+    // another folder, since then is not read.
+    let dir = match expected {
+        Some(id) => {
+            let dir = Dir::open_nofollow(path).ok()?;
+            let st = dir.stat_self().ok()?;
+            if (st.dev, st.ino) != id {
+                return None;
+            }
+            dir
         }
+        None => Dir::open(path).ok()?,
     };
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut subdirs: Vec<(usize, PathBuf)> = Vec::new();
-    let mut unreadable = false;
-    for de in rd {
-        let Ok(de) = de else {
-            unreadable = true;
+    let (names, mut complete) = dir.names(MAX_FOLDER_ENTRIES, &stop).ok()?;
+    let mut found = Vec::with_capacity(names.len());
+    for name in names {
+        if found.len() % 1024 == 0 && stop() {
+            complete = false;
+            break;
+        }
+        // Relative to the open folder, never through a link.
+        let Ok(st) = dir.stat(&name) else {
+            complete = false;
             continue;
         };
+        found.push(Found {
+            name: std::ffi::OsString::from_vec(name.into_bytes()),
+            is_dir: st.kind == Kind::Dir,
+            is_symlink: st.kind == Kind::Symlink,
+            size: st.blocks * 512,
+            mtime: st.mtime.max(0),
+            hidden: st.hidden,
+            id: (st.dev, st.ino),
+            links: st.nlink,
+        });
+    }
+    Some((found, complete))
+}
+
+#[cfg(not(unix))]
+fn list(s: &Shared, path: &Path, _expected: Option<(u64, u64)>) -> Option<(Vec<Found>, bool)> {
+    let mut found = Vec::new();
+    let mut complete = true;
+    for de in fs::read_dir(path).ok()? {
+        if found.len() >= MAX_FOLDER_ENTRIES || (found.len() % 1024 == 0 && s.cancel.load(Ordering::Acquire)) {
+            complete = false;
+            break;
+        }
         // `DirEntry::metadata` never follows symlinks.
-        let Ok(md) = de.metadata() else {
-            unreadable = true;
+        let Some((de, md)) = de.ok().and_then(|de| de.metadata().ok().map(|md| (de, md))) else {
+            complete = false;
             continue;
         };
-        let name = de.file_name();
         let ft = md.file_type();
+        found.push(Found {
+            name: de.file_name(),
+            is_dir: ft.is_dir(),
+            is_symlink: ft.is_symlink(),
+            size: disk_size(&md),
+            mtime: mtime_of(&md),
+            hidden: hidden_attribute(&md),
+            id: (0, 0),
+            links: 1,
+        });
+    }
+    Some((found, complete))
+}
+
+fn scan_dir(s: &Shared, id: NodeId, path: &Path, expected: Option<(u64, u64)>) {
+    let Some((found, complete)) = list(s, path, expected) else {
+        s.tree.write().mark_denied(id);
+        return;
+    };
+    let mut entries: Vec<Entry> = Vec::with_capacity(found.len());
+    let mut subdirs: Vec<(usize, PathBuf, (u64, u64))> = Vec::new();
+    let mut dir_ids: Vec<(usize, (u64, u64))> = Vec::new();
+    for f in found {
         let mut flags = 0u8;
-        if is_hidden(&name, &md) {
+        if f.hidden || f.name.to_string_lossy().starts_with('.') {
             flags |= F_HIDDEN;
         }
         let mut size = 0u64;
-        if ft.is_symlink() {
+        if f.is_symlink {
             flags |= F_SYMLINK;
-            size = disk_size(&md);
-        } else if ft.is_dir() {
+            size = f.size;
+        } else if f.is_dir {
             flags |= F_DIR;
-            if is_package(&name) {
+            if is_package(&f.name) {
                 flags |= F_PACKAGE;
             }
-            let child = path.join(&name);
+            let child = path.join(&f.name);
             if s.policy.skip.iter().any(|p| p == &child) {
                 continue;
             }
-            if same_filesystem(&s.policy, &md) {
-                subdirs.push((entries.len(), child));
-            } else {
+            if cfg!(unix) {
+                dir_ids.push((entries.len(), f.id));
+            }
+            if !same_filesystem(&s.policy, f.id.0) {
                 flags |= F_OTHER_FS;
+            } else if first_visit(s, f.id) {
+                // A folder reachable under a second name is read only once.
+                subdirs.push((entries.len(), child, f.id));
             }
         } else {
-            size = disk_size(&md);
-            if size > 0 && already_counted(s, &md) {
+            size = f.size;
+            if size > 0 && f.links > 1 && already_counted(s, f.id) {
                 size = 0;
             }
         }
-        entries.push(Entry { name, size, mtime: mtime_of(&md), flags });
+        entries.push(Entry { name: f.name, size, mtime: f.mtime, flags });
     }
     s.entries.fetch_add(entries.len() as u64, Ordering::Relaxed);
-    if unreadable {
+    if !complete {
         // Part of the folder is missing from the results: report it.
         s.tree.write().mark_denied(id);
     }
     if entries.is_empty() {
         return;
     }
-    let start = s.tree.write().add_children(id, entries);
+    let start = {
+        let mut tree = s.tree.write();
+        let start = tree.add_children(id, entries);
+        tree.dir_ids.extend(dir_ids.into_iter().map(|(i, ident)| (start + i as u32, ident)));
+        start
+    };
     if !subdirs.is_empty() {
         s.pending.fetch_add(subdirs.len(), Ordering::AcqRel);
         let mut q = s.queue.lock();
-        for (i, p) in subdirs {
-            q.push((start + i as u32, p));
+        for (i, p, identity) in subdirs {
+            q.push((start + i as u32, p, cfg!(unix).then_some(identity)));
         }
         drop(q);
         s.cv.notify_all();
     }
 }
 
-#[cfg(unix)]
-fn same_filesystem(policy: &Policy, md: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    policy.devices.is_empty() || policy.devices.contains(&md.dev())
+fn same_filesystem(policy: &Policy, device: u64) -> bool {
+    !cfg!(unix) || policy.devices.is_empty() || policy.devices.contains(&device)
 }
 
-#[cfg(not(unix))]
-fn same_filesystem(_policy: &Policy, _md: &fs::Metadata) -> bool {
-    true
+fn first_visit(s: &Shared, id: (u64, u64)) -> bool {
+    !cfg!(unix) || s.dirs.lock().insert(id)
 }
 
 /// Counts a multiply linked file only the first time it is met.
-#[cfg(unix)]
-fn already_counted(s: &Shared, md: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    md.nlink() > 1 && !s.links.lock().insert((md.dev(), md.ino()))
+fn already_counted(s: &Shared, id: (u64, u64)) -> bool {
+    !s.links.lock().insert(id)
 }
 
-#[cfg(not(unix))]
-fn already_counted(_s: &Shared, _md: &fs::Metadata) -> bool {
-    false
-}
-
-/// Space actually allocated on disk, so sparse, compressed and cloud-only
-/// files are not over-reported.
-#[cfg(unix)]
-fn disk_size(md: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    md.blocks() * 512
-}
-
+/// Space actually taken on disk. On Unix the listing reports allocated
+/// blocks, so sparse, compressed and cloud-only files are not over-reported.
 #[cfg(windows)]
 fn disk_size(md: &fs::Metadata) -> u64 {
     use std::os::windows::fs::MetadataExt;
@@ -291,12 +373,8 @@ fn disk_size(md: &fs::Metadata) -> u64 {
     md.len()
 }
 
-#[cfg(not(any(unix, windows)))]
-fn disk_size(md: &fs::Metadata) -> u64 {
-    md.len()
-}
 
-fn mtime_of(md: &fs::Metadata) -> i64 {
+pub(crate) fn mtime_of(md: &fs::Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -304,28 +382,19 @@ fn mtime_of(md: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn is_hidden(name: &std::ffi::OsStr, md: &fs::Metadata) -> bool {
-    if name.to_string_lossy().starts_with('.') {
-        return true;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::macos::fs::MetadataExt;
-        const UF_HIDDEN: u32 = 0x8000;
-        if md.st_flags() & UF_HIDDEN != 0 {
-            return true;
-        }
-    }
+#[cfg(not(unix))]
+fn hidden_attribute(md: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-        if md.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
-            return true;
-        }
+        md.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
     }
-    let _ = md;
-    false
+    #[cfg(not(windows))]
+    {
+        let _ = md;
+        false
+    }
 }
 
 /// macOS presents some directories as single documents.

@@ -22,16 +22,48 @@ const ROW_H: f32 = 32.0;
 const FLAT_ROW_H: f32 = 46.0;
 const COL_W: f32 = 264.0;
 const FLAT_W: f32 = 320.0;
-/// Room left of the toolbar for the macOS window buttons.
-const TRAFFIC_LIGHTS: f32 = 72.0;
+/// Seconds the columns take to slide to a newly opened one.
+const SLIDE: f64 = 0.18;
 
 fn mac() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Where the macOS window buttons belong: left edge and vertical centre, on the toolbar line.
+#[cfg(target_os = "macos")]
+pub fn window_buttons_at() -> (f32, f32) {
+    (PAD + 14.0, PAD + TOPBAR_H * 0.5)
+}
+
+/// Where the outline columns are and how far they scroll sideways, as last drawn.
+#[derive(Clone, Copy)]
+pub struct StripScroll {
+    pub rect: Rect,
+    pub offset: f32,
+    /// Offset that shows the last column.
+    pub end: f32,
+}
+
+pub fn strip_scroll(ctx: &egui::Context) -> StripScroll {
+    let none = StripScroll { rect: Rect::NOTHING, offset: 0.0, end: 0.0 };
+    ctx.data(|d| d.get_temp(egui::Id::new("strip-scroll"))).unwrap_or(none)
+}
+
+/// Sideways scroll of the outline columns, kept between frames.
+#[derive(Clone, Default)]
+struct Strip {
+    /// Session and move the columns were last laid out for.
+    nav: (u64, u64),
+    path: Vec<NodeId>,
+    offset: f32,
+    /// Running slide to the last column: where and when it started.
+    slide: Option<(f32, f64)>,
+}
+
 impl App {
     pub fn draw(&mut self, ctx: &egui::Context, acts: &mut Vec<Action>) {
         let focus_search = std::mem::take(&mut self.focus_search);
+        ctx.data_mut(|d| d.remove::<StripScroll>(egui::Id::new("strip-scroll")));
         let app: &App = self;
         if !mac() {
             app.menu_bar(ctx, acts);
@@ -91,6 +123,8 @@ impl App {
                     ui.separator();
                     entry(ui, if self.settings.show_chart { t("Hide Chart") } else { t("Show Chart") }, "", Cmd::ToggleChart);
                     ui.separator();
+                    entry(ui, t("Back"), "Ctrl+[", Cmd::GoBack);
+                    entry(ui, t("Forward"), "Ctrl+]", Cmd::GoForward);
                     entry(ui, t("Go to Parent Folder"), "Ctrl+↑", Cmd::GoParent);
                     entry(ui, t("Go to Root Folder"), "", Cmd::GoRoot);
                 });
@@ -147,12 +181,14 @@ impl App {
     fn sidebar(&self, ui: &mut Ui, rect: Rect, acts: &mut Vec<Action>) {
         let pal = &self.pal;
         widgets::gradient_panel(ui.painter(), rect, 14.0, pal.side_top, pal.side_bottom, pal.panel_line);
-        let top = Rect::from_min_size(rect.min, vec2(rect.width(), 44.0));
+        // On macOS the window buttons and the toggles share the line of the toolbar.
+        let head = if mac() { TOPBAR_H } else { 46.0 };
+        let top = Rect::from_min_size(rect.min, vec2(rect.width(), head - 2.0));
         self.drag_region(ui, top, "side");
-        let x = if mac() { rect.left() + TRAFFIC_LIGHTS + 4.0 } else { rect.left() + 12.0 };
-        self.panel_toggles(ui, x, rect.top() + if mac() { 14.0 } else { 24.0 }, acts);
+        let x = if self.lights > 0.0 { self.lights + 10.0 } else { rect.left() + 12.0 };
+        self.panel_toggles(ui, x, rect.top() + if mac() { head * 0.5 } else { 24.0 }, acts);
 
-        let list = Rect::from_min_max(pos2(rect.left(), rect.top() + 46.0), pos2(rect.right(), rect.bottom() - 52.0));
+        let list = Rect::from_min_max(pos2(rect.left(), rect.top() + head), pos2(rect.right(), rect.bottom() - 52.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list).id_salt("sidebar-list"));
         child.spacing_mut().item_spacing = vec2(0.0, 0.0);
         egui::ScrollArea::vertical().id_salt("sidebar-scroll").auto_shrink([false, false]).show(&mut child, |ui| {
@@ -296,8 +332,8 @@ impl App {
         let cy = rect.center().y;
         let mut x = rect.left() + 14.0;
         if !self.settings.sidebar_open {
-            if mac() {
-                x += TRAFFIC_LIGHTS;
+            if self.lights > 0.0 {
+                x = x.max(self.lights + 10.0);
             }
             x = self.panel_toggles(ui, x, cy, acts) + 6.0;
         }
@@ -465,16 +501,16 @@ impl App {
             self.flat_list(ui, list, s, acts);
             lists_right = list.right();
         } else {
-            let fit = (((rect.width() - chart_min) / COL_W).floor() as usize).clamp(1, s.columns.len().max(1));
-            let skip = s.columns.len().saturating_sub(fit);
-            let mut x = rect.left();
-            for (ci, col) in s.columns.iter().enumerate().skip(skip) {
-                let w = if self.settings.show_chart { COL_W.min(rect.width()) } else { COL_W.max(rect.width() / fit as f32) };
-                let r = Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height()));
-                self.column(ui, r, ci, col, s, acts);
-                x += w;
-            }
-            lists_right = x;
+            // As many columns as fit while the chart keeps a fair share; the others scroll sideways.
+            let room = if self.settings.show_chart { rect.width() - chart_min.max(rect.width() * 0.42) } else { rect.width() };
+            // A selected file gets one more pane, with its preview.
+            let file = s.selected_file();
+            let panes = s.columns.len() + file.is_some() as usize;
+            let shown = ((room / COL_W).floor() as usize).clamp(1, panes.max(1));
+            let w = if self.settings.show_chart { COL_W.min(rect.width()) } else { rect.width() / shown as f32 };
+            let strip = Rect::from_min_size(rect.min, vec2(w * shown as f32, rect.height()));
+            self.columns(ui, strip, w, file, s, acts);
+            lists_right = strip.right();
         }
         ui.painter().line_segment(
             [pos2(lists_right, rect.top()), pos2(lists_right, rect.bottom())],
@@ -488,7 +524,125 @@ impl App {
         }
     }
 
-    fn column(&self, ui: &mut Ui, rect: Rect, ci: usize, col: &Column, s: &Session, acts: &mut Vec<Action>) {
+    /// The outline: one column per opened folder, sliding to the last one after each move.
+    fn columns(&self, ui: &mut Ui, strip: Rect, col_w: f32, file: Option<NodeId>, s: &Session, acts: &mut Vec<Action>) {
+        let total = (s.columns.len() + file.is_some() as usize) as f32 * col_w;
+        let end = (total - strip.width()).max(0.0);
+        let id = ui.id().with("columns");
+        let now = ui.input(|i| i.time);
+        let mut state: Strip = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+        // Columns from this one on have a new selection to bring into sight.
+        let mut fresh = usize::MAX;
+        if state.nav != (s.id, s.nav_seq) {
+            // Another scan, or a screenshot run, shows the last column at once.
+            let jump = state.nav.0 != s.id || self.opts.shot.is_some();
+            state.slide = Some(if jump { (end, now - SLIDE) } else { (state.offset, now) });
+            fresh = if jump { 0 } else { state.path.iter().zip(&s.open).take_while(|(a, b)| a == b).count() };
+            state.nav = (s.id, s.nav_seq);
+            state.path = s.open.clone();
+        }
+        let mut area = egui::ScrollArea::horizontal().id_salt("columns").auto_shrink([false, false]).drag_to_scroll(false);
+        if let Some((from, start)) = state.slide {
+            let t = (((now - start) / SLIDE) as f32).clamp(0.0, 1.0);
+            area = area.horizontal_scroll_offset(from + (end - from) * (1.0 - (1.0 - t).powi(3)));
+            if t < 1.0 {
+                ui.ctx().request_repaint();
+            } else {
+                state.slide = None;
+            }
+        }
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(strip).id_salt("columns"));
+        // The bar that brings the earlier columns back stays in sight, below the columns.
+        child.spacing_mut().scroll = egui::style::ScrollStyle { bar_width: 7.0, bar_inner_margin: 2.0, ..egui::style::ScrollStyle::solid() };
+        let out = area.show(&mut child, |ui| {
+            let (all, _) = ui.allocate_exact_size(vec2(total.max(ui.available_width()), ui.available_height()), Sense::hover());
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+            let pane = |i: usize| Rect::from_min_size(pos2(all.left() + i as f32 * col_w, all.top()), vec2(col_w, all.height()));
+            for (ci, col) in s.columns.iter().enumerate() {
+                if pane(ci).intersects(ui.clip_rect()) {
+                    self.column(ui, pane(ci), ci, col, s, ci >= fresh, acts);
+                }
+            }
+            if let Some(id) = file.filter(|_| pane(s.columns.len()).intersects(ui.clip_rect())) {
+                self.preview(ui, pane(s.columns.len()), id, acts);
+            }
+        });
+        state.offset = out.state.offset.x;
+        let seen = StripScroll { rect: strip, offset: state.offset, end };
+        ui.data_mut(|d| {
+            d.insert_temp(egui::Id::new("strip-scroll"), seen);
+            d.insert_temp(id, state);
+        });
+    }
+
+    /// The pane after the columns for a selected file: thumbnail, details and what to do with it.
+    fn preview(&self, ui: &mut Ui, rect: Rect, id: NodeId, acts: &mut Vec<Action>) {
+        let pal = &self.pal;
+        let Some(info) = self.info_for(Some(id)) else { return };
+        ui.painter().line_segment([rect.left_top(), rect.left_bottom()], Stroke::new(1.0_f32, pal.panel_line.gamma_multiply(0.6)));
+        let inner = rect.shrink2(vec2(14.0, 12.0));
+        let p = ui.painter_at(rect);
+
+        // Details, bottom up: buttons, then the facts, then the name; the picture takes the rest.
+        let font = regular(12.0);
+        let mut lines: Vec<(&str, String)> = vec![(t("Kind:"), t(info.kind).to_string())];
+        if let Some(size) = info.size {
+            lines.push((t("Size:"), util::fmt_size(size)));
+        }
+        lines.push((t("Created:"), util::fmt_date(info.created, true)));
+        lines.push((t("Modified:"), util::fmt_date(info.modified, true)));
+        let folder = info.path.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        lines.push((t("Where:"), folder.clone()));
+        let buttons = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 30.0), inner.max);
+        let facts = Rect::from_min_max(pos2(inner.left(), buttons.top() - 14.0 - 12.0 - lines.len() as f32 * 19.0), pos2(inner.right(), buttons.top() - 14.0));
+        let name_y = facts.top() - 22.0;
+        let picture = Rect::from_min_max(inner.min, pos2(inner.right(), name_y - 20.0));
+
+        if picture.height() > 40.0 {
+            match self.thumbs.get(&info.path) {
+                Some(texture) => {
+                    let size = texture.size_vec2();
+                    let scale = (picture.width() / size.x).min(picture.height() / size.y).min(1.0);
+                    let r = Rect::from_center_size(picture.center(), size * scale);
+                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    p.add(egui::epaint::RectShape::filled(r, CornerRadius::same(4), Color32::WHITE).with_texture(texture.id(), uv));
+                }
+                None => {
+                    let side = picture.width().min(picture.height()).min(96.0);
+                    widgets::item_icon(&p, Rect::from_center_size(picture.center(), vec2(side, side)), info.flags, pal, false);
+                }
+            }
+        }
+        let name = widgets::fit_middle(ui, &info.name, &semibold(14.0), inner.width());
+        p.text(pos2(inner.center().x, name_y), Align2::CENTER_CENTER, name, semibold(14.0), pal.text);
+
+        p.rect_filled(facts, CornerRadius::same(8), pal.control.gamma_multiply(0.45));
+        p.rect_stroke(facts, CornerRadius::same(8), Stroke::new(1.0_f32, pal.control_line.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+        let label_w = lines.iter().map(|l| widgets::text_width(ui, l.0, &font)).fold(0.0, f32::max);
+        for (i, (label, value)) in lines.iter().enumerate() {
+            let y = facts.top() + 6.0 + 9.5 + i as f32 * 19.0;
+            p.text(pos2(facts.left() + 10.0, y), Align2::LEFT_CENTER, *label, font.clone(), pal.text_dim);
+            let value = widgets::fit_middle(ui, value, &font, facts.width() - 30.0 - label_w);
+            p.text(pos2(facts.right() - 10.0, y), Align2::RIGHT_CENTER, value, font.clone(), pal.text);
+        }
+        ui.interact(facts, ui.id().with(("preview-facts", id)), Sense::hover()).on_hover_text(info.path.to_string_lossy());
+
+        let half = (buttons.width() - 8.0) * 0.5;
+        let open = Rect::from_min_size(buttons.min, vec2(half, buttons.height()));
+        let reveal = Rect::from_min_size(pos2(buttons.right() - half, buttons.top()), vec2(half, buttons.height()));
+        let label = widgets::fit_end(ui, t("Open"), &regular(12.5), half - 12.0);
+        if widgets::button(ui, open, &label, Btn::Outline, true, pal, regular(12.5)).clicked() {
+            acts.push(Action::Open(id));
+        }
+        let label = widgets::fit_end(ui, reveal_label(), &regular(12.5), half - 12.0);
+        if widgets::button(ui, reveal, &label, Btn::Outline, true, pal, regular(12.5)).clicked() {
+            acts.push(Action::On(Cmd::Reveal, id));
+        }
+    }
+
+    /// One column. `reveal` scrolls it to its selected row.
+    #[allow(clippy::too_many_arguments)]
+    fn column(&self, ui: &mut Ui, rect: Rect, ci: usize, col: &Column, s: &Session, reveal: bool, acts: &mut Vec<Action>) {
         let pal = &self.pal;
         if ci > 0 {
             ui.painter().line_segment([rect.left_top(), rect.left_bottom()], Stroke::new(1.0_f32, pal.panel_line.gamma_multiply(0.6)));
@@ -507,10 +661,19 @@ impl App {
             return;
         }
         let selected = s.open.get(ci).copied();
-        egui::ScrollArea::vertical()
-            .id_salt(("column-scroll", ci, col.dir))
-            .auto_shrink([false, false])
-            .show_rows(&mut child, ROW_H, col.items.len(), |ui, range| {
+        let salt = egui::Id::new(("column-scroll", ci, col.dir));
+        let mut area = egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]);
+        let index_of = |id: NodeId| col.items.iter().position(|i| matches!(i, Item::Row(r) | Item::Member(r) if r.id == id));
+        if let Some(i) = selected.filter(|_| reveal).and_then(index_of) {
+            let seen = egui::scroll_area::State::load(ui.ctx(), child.make_persistent_id(salt)).map(|s| s.offset.y).unwrap_or(0.0);
+            let (top, bottom) = (i as f32 * ROW_H, (i + 1) as f32 * ROW_H);
+            if top < seen {
+                area = area.vertical_scroll_offset(top);
+            } else if bottom > seen + child.max_rect().height() {
+                area = area.vertical_scroll_offset(bottom - child.max_rect().height());
+            }
+        }
+        area.show_rows(&mut child, ROW_H, col.items.len(), |ui, range| {
                 for item in &col.items[range] {
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
                     match item {
@@ -589,9 +752,11 @@ impl App {
         if resp.hovered() || cb_resp.hovered() {
             acts.push(Action::Hover(row.id, false));
         }
-        if resp.double_clicked() && row.flags & F_DIR != 0 {
-            acts.push(Action::Drill(row.id));
-        } else if resp.clicked() {
+        // A double-click opens a file. On a folder its second click is dropped:
+        // it may land on a column that just slid in.
+        if resp.double_clicked() && row.flags & F_DIR == 0 {
+            acts.push(Action::Open(row.id));
+        } else if resp.clicked() && !resp.double_clicked() {
             match col {
                 Some(c) => acts.push(Action::RowClick { col: c, id: row.id }),
                 None => acts.push(Action::FlatClick(row.id)),
@@ -623,7 +788,7 @@ impl App {
         entry(ui, t("Copy to Folder…"), Action::On(Cmd::Copy, id));
         if flags & F_DIR != 0 {
             ui.separator();
-            entry(ui, t("Go to Folder"), Action::Drill(id));
+            entry(ui, t("Go to Folder"), Action::SelectPath(id));
             entry(ui, t("Add Folder to Favorites"), Action::On(Cmd::AddFavorite, id));
         }
     }
@@ -702,7 +867,7 @@ impl App {
             acts.push(Action::Hover(row.id, false));
         }
         if resp.double_clicked() {
-            acts.push(Action::SelectPath(row.id));
+            acts.push(if row.flags & F_DIR == 0 { Action::Open(row.id) } else { Action::SelectPath(row.id) });
         } else if resp.clicked() {
             acts.push(Action::FlatClick(row.id));
         }
@@ -786,14 +951,14 @@ impl App {
                     SegKind::Node => {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         acts.push(Action::Hover(seg.id, true));
-                        if resp.double_clicked() {
-                            acts.push(Action::Drill(seg.id));
-                        } else if resp.clicked() {
+                        // The chart is laid out anew after a click: the second click of a
+                        // double-click would hit whatever came under the pointer.
+                        if resp.clicked() && !resp.double_clicked() {
                             acts.push(Action::SelectPath(seg.id));
                         }
                     }
                     SegKind::Small => {
-                        if resp.clicked() && seg.id != s.view_root {
+                        if resp.clicked() && !resp.double_clicked() && seg.id != s.view_root {
                             acts.push(Action::SelectPath(seg.id));
                         }
                     }
@@ -842,6 +1007,7 @@ impl App {
         let pal = &self.pal;
         ui.painter().rect_filled(rect, CornerRadius::ZERO, pal.bar);
         let font = regular(12.5);
+        let file = s.selected_file();
         let widths: Vec<f32> = s.crumbs.iter().map(|c| widgets::text_width(ui, &c.1, &font).min(220.0) + 22.0).collect();
         // Drop leading folders when the path does not fit.
         let mut first = 0;
@@ -863,7 +1029,12 @@ impl App {
             if resp.hovered() {
                 ui.painter().rect_filled(r, CornerRadius::same(5), pal.row_hover);
             }
-            icons::folder(ui.painter(), Rect::from_center_size(pos2(x + 7.0, cy), vec2(14.0, 14.0)), pal.folder, pal.folder_tab);
+            let icon = Rect::from_center_size(pos2(x + 7.0, cy), vec2(14.0, 14.0));
+            if file == Some(*id) {
+                widgets::item_icon(ui.painter(), icon, 0, pal, false);
+            } else {
+                icons::folder(ui.painter(), icon, pal.folder, pal.folder_tab);
+            }
             let label = widgets::fit_middle(ui, name, &font, 220.0);
             ui.painter().text(pos2(x + 19.0, cy), Align2::LEFT_CENTER, label, font.clone(), pal.text_dim);
             if resp.clicked() {

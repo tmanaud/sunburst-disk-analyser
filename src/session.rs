@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 /// Most rows built per list; the rest is summarised in a "more" row.
 const MAX_ROWS: usize = 20_000;
+/// Most steps kept for back and forward.
+const MAX_HISTORY: usize = 200;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -25,6 +27,15 @@ pub enum Tab {
 pub enum GroupKind {
     Small,
     Hidden,
+}
+
+/// An arrow key pressed in the outline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,6 +84,8 @@ pub enum CheckError {
     Hidden,
     System,
     Empty,
+    /// Another volume or a folder that could not be read: its content is unknown.
+    Unscanned,
 }
 
 pub struct Session {
@@ -81,10 +94,17 @@ pub struct Session {
     pub name: String,
     pub scan: ScanHandle,
     pub space: Option<Space>,
-    /// Folder shown in the first column and at the centre of the chart.
-    pub view_root: NodeId,
-    /// Chain of clicked items below `view_root`, one per column.
+    /// Chain of clicked items below the scan root, one per column.
     pub open: Vec<NodeId>,
+    /// Folder at the centre of the chart: the one holding the last item of `open`.
+    pub view_root: NodeId,
+    /// Paths visited, for back and forward.
+    history: Vec<Vec<NodeId>>,
+    hist_pos: usize,
+    /// The current step was made with the arrow keys.
+    hist_keys: bool,
+    /// Changes with every move, so the views can bring the selection into sight.
+    pub nav_seq: u64,
     pub tab: Tab,
     pub checked: BTreeSet<NodeId>,
     pub expanded: HashSet<(NodeId, GroupKind)>,
@@ -128,8 +148,12 @@ impl Session {
             name,
             scan,
             space,
-            view_root: 0,
             open: Vec::new(),
+            view_root: 0,
+            history: vec![Vec::new()],
+            hist_pos: 0,
+            hist_keys: false,
+            nav_seq: 0,
             tab: Tab::Outline,
             checked: BTreeSet::new(),
             expanded: HashSet::new(),
@@ -176,30 +200,59 @@ impl Session {
         self.open.last().copied().unwrap_or(self.view_root)
     }
 
+    /// The file at the end of the path, shown in the preview pane.
+    pub fn selected_file(&self) -> Option<NodeId> {
+        let id = *self.open.last()?;
+        let tree = self.scan.tree.read();
+        (!tree.node(id).is_dir() && !tree.is_gone(id)).then_some(id)
+    }
+
     pub fn path_of(&self, id: NodeId) -> PathBuf {
         self.scan.tree.read().path(id)
     }
 
     // ---- navigation -------------------------------------------------------
 
+    /// Moves to `path`, a chain of items below the scan root.
+    fn go(&mut self, path: Vec<NodeId>, keys: bool) {
+        if path == self.open {
+            return;
+        }
+        let tree = self.scan.tree.read();
+        let same_folder = folder_of(&tree, &path) == folder_of(&tree, &self.open);
+        drop(tree);
+        self.view_root = centre_of(&path);
+        self.open = path;
+        if same_folder || (keys && self.hist_keys) {
+            // Another item of the same folder, or one more key press: not a new step.
+            self.history[self.hist_pos] = self.open.clone();
+        } else {
+            self.history.truncate(self.hist_pos + 1);
+            if self.history.len() == MAX_HISTORY {
+                self.history.remove(0);
+            }
+            self.history.push(self.open.clone());
+            self.hist_pos = self.history.len() - 1;
+            self.hist_keys = keys;
+        }
+        self.hist_keys &= keys;
+        self.nav_seq += 1;
+        self.dirty = true;
+    }
+
     /// A row of column `col` was clicked.
     pub fn select(&mut self, col: usize, id: NodeId) {
-        self.open.truncate(col);
-        self.open.push(id);
-        self.dirty = true;
+        let mut path = self.open[..col.min(self.open.len())].to_vec();
+        path.push(id);
+        self.go(path, false);
     }
 
     /// Opens the columns leading to `id` (used by the chart and the flat lists).
     pub fn select_path(&mut self, id: NodeId) {
         let tree = self.scan.tree.read();
-        if !tree.is_ancestor(self.view_root, id) {
-            self.view_root = tree.root();
-        }
-        let chain = tree.chain(id);
-        let from = chain.iter().position(|&c| c == self.view_root).map(|i| i + 1).unwrap_or(1);
-        self.open = chain[from..].to_vec();
+        let path = tree.chain(id)[1..].to_vec();
         // Make sure the item is visible when it sits in a collapsed group.
-        for &c in &self.open {
+        for &c in &path {
             let n = tree.node(c);
             if n.is_hidden() {
                 self.expanded.insert((n.parent, GroupKind::Hidden));
@@ -211,43 +264,97 @@ impl Session {
         self.tab = Tab::Outline;
         self.search_open = false;
         self.dirty = true;
+        self.go(path, false);
     }
 
-    /// Makes `id` the folder shown in the first column and the chart centre.
-    pub fn drill(&mut self, id: NodeId) {
-        if self.scan.tree.read().node(id).is_dir() {
-            self.view_root = id;
-            self.open.clear();
-            self.tab = Tab::Outline;
-            self.dirty = true;
-        }
-    }
-
+    /// One level up: the folder holding the selection becomes the selection.
     pub fn go_parent(&mut self) {
-        let parent = self.scan.tree.read().node(self.view_root).parent;
-        if parent != NO_NODE {
-            let child = self.view_root;
-            self.view_root = parent;
-            self.open = vec![child];
-            self.dirty = true;
+        let mut path = self.open.clone();
+        if path.pop().is_some() {
+            self.go(path, false);
         }
     }
 
     pub fn go_root(&mut self) {
-        self.view_root = 0;
-        self.open.clear();
-        self.dirty = true;
+        self.go(Vec::new(), false);
     }
 
     /// A breadcrumb was clicked.
     pub fn go_crumb(&mut self, id: NodeId) {
-        if let Some(i) = self.open.iter().position(|&c| c == id) {
-            self.open.truncate(i + 1);
+        let path = self.scan.tree.read().chain(id)[1..].to_vec();
+        self.go(path, false);
+    }
+
+    pub fn can_go(&self, forward: bool) -> bool {
+        if forward {
+            self.hist_pos + 1 < self.history.len()
         } else {
-            self.view_root = id;
-            self.open.clear();
+            self.hist_pos > 0
         }
-        self.dirty = true;
+    }
+
+    /// Back or forward through the visited folders. Returns false at either end.
+    pub fn go_history(&mut self, forward: bool) -> bool {
+        let tree = self.scan.tree.read();
+        while self.can_go(forward) {
+            self.hist_pos = if forward { self.hist_pos + 1 } else { self.hist_pos - 1 };
+            let mut path = self.history[self.hist_pos].clone();
+            // Items removed since the visit end the path early.
+            if let Some(i) = path.iter().position(|&id| tree.is_gone(id)) {
+                path.truncate(i);
+            }
+            if path != self.open {
+                self.view_root = centre_of(&path);
+                self.open = path;
+                self.hist_keys = false;
+                self.nav_seq += 1;
+                self.dirty = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// An arrow key: up and down move in the column of the selected item,
+    /// left and right change column.
+    pub fn step(&mut self, step: Step) {
+        if self.dirty {
+            // The columns must match `open` before they are used to move in it.
+            self.rebuild(self.scan.is_done());
+        }
+        let ids = |c: &Column| -> Vec<NodeId> {
+            c.items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Row(r) | Item::Member(r) => Some(r.id),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut path = self.open.clone();
+        let next = match (step, path.pop()) {
+            (Step::Left, Some(_)) => None,
+            (Step::Left, None) => return,
+            // Into the folder just left on the path, or the first column when nothing is selected.
+            (Step::Right, last) => {
+                path.extend(last);
+                self.columns.get(path.len()).and_then(|c| ids(c).first().copied())
+            }
+            (_, None) => self.columns.first().and_then(|c| ids(c).first().copied()),
+            (_, Some(last)) => {
+                let Some(col) = self.columns.get(path.len()) else { return };
+                let ids = ids(col);
+                let Some(i) = ids.iter().position(|&id| id == last) else { return };
+                let j = if step == Step::Down { i + 1 } else { i.wrapping_sub(1) };
+                ids.get(j).copied()
+            }
+        };
+        match (step, next) {
+            (Step::Left, _) => {}
+            (_, Some(id)) => path.push(id),
+            (_, None) => return,
+        }
+        self.go(path, true);
     }
 
     pub fn toggle_group(&mut self, dir: NodeId, kind: GroupKind) {
@@ -274,6 +381,9 @@ impl Session {
         }
         if id == tree.root() || ops::protected_reason(&tree.path(id)).is_some() {
             return Err(CheckError::System);
+        }
+        if tree.unscanned(id) {
+            return Err(CheckError::Unscanned);
         }
         if n.size == 0 && !n.is_dir() {
             return Err(CheckError::Empty);
@@ -306,7 +416,11 @@ impl Session {
             .map(|id| {
                 let n = tree.node(id);
                 let path = tree.path(id);
-                OpItem { id, ident: ops::Ident::of(&path), path, size: n.size, is_dir: n.is_dir() }
+                // An item that no longer matches the scan gets no identity and
+                // is refused when the operation runs.
+                let scanned_as = tree.dir_ids.get(&id).copied();
+                let ident = ops::Ident::of(&path).filter(|_| ops::unchanged_since_scan(&path, n.is_dir(), n.mtime, scanned_as));
+                OpItem { id, ident, path, size: n.size, is_dir: n.is_dir() }
             })
             .collect();
         items.sort_by(|a, b| b.size.cmp(&a.size));
@@ -325,12 +439,7 @@ impl Session {
             self.checked.remove(&r.item.id);
         }
         let tree = self.scan.tree.read();
-        self.open.retain(|&id| !tree.is_gone(id));
         self.checked.retain(|&id| !tree.is_gone(id));
-        if tree.chain(self.view_root).iter().any(|&a| tree.node(a).is_deleted()) {
-            self.view_root = 0;
-            self.open.clear();
-        }
         drop(tree);
         self.dirty = true;
     }
@@ -403,10 +512,13 @@ impl Session {
 
     fn rebuild(&mut self, done: bool) {
         let tree = self.scan.tree.read();
-        if tree.node(self.view_root).is_deleted() {
-            self.view_root = tree.root();
-            self.open.clear();
+        // A removed item ends the path.
+        if let Some(i) = self.open.iter().position(|&id| tree.is_gone(id)) {
+            self.open.truncate(i);
+            self.history[self.hist_pos] = self.open.clone();
+            self.nav_seq += 1;
         }
+        self.view_root = centre_of(&self.open);
         let root = tree.node(tree.root());
         self.total_size = root.size;
         self.total_items = root.items;
@@ -415,9 +527,7 @@ impl Session {
 
         // Free and unattributed space only make sense for a whole volume.
         let (free, other) = match self.space {
-            Some(s) if done && self.view_root == tree.root() => {
-                (s.free, s.total.saturating_sub(s.free).saturating_sub(root.size))
-            }
+            Some(s) if done => (s.free, s.total.saturating_sub(s.free).saturating_sub(root.size)),
             _ => (0, 0),
         };
 
@@ -455,8 +565,8 @@ impl Session {
             }
         };
 
-        // Columns: the view root, then every opened folder.
-        let mut dirs = vec![self.view_root];
+        // Columns: the scan root, then every opened folder.
+        let mut dirs = vec![tree.root()];
         dirs.extend(self.open.iter().copied().filter(|&id| tree.node(id).is_dir()));
         self.columns.clear();
         for (ci, dir) in dirs.into_iter().enumerate() {
@@ -509,7 +619,11 @@ impl Session {
             self.columns.push(Column { dir, denied: tree.node(dir).flags & F_DENIED != 0, items });
         }
 
-        self.layout = chart::build(&tree, self.view_root, free, other);
+        self.layout = if self.view_root == tree.root() {
+            chart::build(&tree, self.view_root, free, other)
+        } else {
+            chart::build(&tree, self.view_root, 0, 0)
+        };
         self.seg_checked = self
             .layout
             .segs
@@ -534,15 +648,30 @@ impl Session {
 
         // Breadcrumbs: from the scan root to the last opened item.
         self.crumbs.clear();
-        let mut chain = tree.chain(self.view_root);
-        chain.extend(self.open.iter().copied());
-        for (i, id) in chain.into_iter().enumerate() {
+        for (i, id) in std::iter::once(tree.root()).chain(self.open.iter().copied()).enumerate() {
             let name = if i == 0 { self.name.clone() } else { tree.node(id).display_name() };
             self.crumbs.push((id, name));
         }
 
         self.checked.retain(|&id| !tree.is_gone(id));
         self.checked_size = self.checked.iter().map(|&id| tree.node(id).size).sum();
+    }
+}
+
+/// The chart centre for a path: the folder holding its last item, so that the item is on the first ring.
+fn centre_of(path: &[NodeId]) -> NodeId {
+    match path.len() {
+        0 | 1 => 0,
+        n => path[n - 2],
+    }
+}
+
+/// The folder a path leads to: its last item, or the folder holding it when that is a file.
+fn folder_of(tree: &Tree, path: &[NodeId]) -> NodeId {
+    match path.last() {
+        None => tree.root(),
+        Some(&id) if tree.node(id).is_dir() => id,
+        Some(&id) => tree.node(id).parent,
     }
 }
 
@@ -602,17 +731,92 @@ mod tests {
         assert_eq!(s.columns.len(), 2);
         assert_eq!(names(&s.columns[1]), ["a.pdf", "b.pdf"]);
         assert_eq!(s.crumbs.iter().map(|c| c.1.as_str()).collect::<Vec<_>>(), ["root", "docs"]);
-        s.drill(1);
+        assert_eq!(s.view_root, 0, "the selected folder is on the first ring of the chart");
+        // One level deeper the chart centres on the folder holding the selection.
+        s.select(1, 5);
         s.refresh();
-        assert_eq!(s.columns.len(), 1);
-        assert_eq!(s.view_name, "docs");
+        assert_eq!((s.view_root, s.view_name.as_str(), s.open.clone(), s.columns.len()), (1, "docs", vec![1, 5], 2));
+        assert_eq!(names(&s.columns[0]), ["movie.mkv", "docs", "Small", "Hidden"]);
+        assert_eq!(s.selected_file(), Some(5));
         s.go_parent();
         s.refresh();
-        assert_eq!(s.view_root, 0);
-        assert_eq!(s.open, vec![1]);
+        assert_eq!((s.view_root, s.open.clone(), s.selected_file()), (0, vec![1], None));
         s.select_path(6);
         s.refresh();
         assert_eq!(s.open, vec![1, 6]);
+        s.go_crumb(1);
+        assert_eq!(s.open, vec![1]);
+        s.go_root();
+        assert_eq!((s.view_root, s.open.clone()), (0, vec![]));
+    }
+
+    #[test]
+    fn back_and_forward_follow_the_visited_folders() {
+        let mut s = session();
+        assert!(!s.go_history(false));
+        s.select(0, 1);
+        s.select(1, 5);
+        s.select(1, 6);
+        s.select(0, 3);
+        assert_eq!((s.view_root, s.open.clone()), (0, vec![3]));
+        // Files picked inside a folder are one step with it, and come back selected.
+        assert!(s.go_history(false));
+        assert_eq!((s.view_root, s.open.clone()), (1, vec![1, 6]));
+        assert!(s.go_history(false));
+        assert_eq!(s.open, Vec::<NodeId>::new());
+        assert!(!s.can_go(false));
+        assert!(s.go_history(true));
+        assert!(s.go_history(true));
+        assert_eq!(s.open, vec![3]);
+        assert!(!s.go_history(true));
+        // Moving somewhere else drops the steps ahead.
+        s.go_history(false);
+        s.go_root();
+        assert!(!s.can_go(true));
+        assert!(s.go_history(false));
+        assert_eq!(s.open, vec![1, 6]);
+    }
+
+    #[test]
+    fn history_skips_removed_items() {
+        let mut s = session();
+        s.select(0, 1);
+        s.go_root();
+        s.select(0, 3);
+        s.scan.tree.write().remove(1);
+        assert!(s.go_history(false));
+        assert_eq!((s.view_root, s.open.clone()), (0, vec![]));
+        assert!(!s.go_history(false), "the removed folder is not shown again");
+        assert!(s.go_history(true));
+        assert_eq!(s.open, vec![3]);
+    }
+
+    #[test]
+    fn arrow_keys_walk_the_columns() {
+        let mut s = session();
+        s.refresh();
+        s.step(Step::Down);
+        assert_eq!(s.open, vec![2], "first row of the first column");
+        s.step(Step::Down);
+        assert_eq!(s.open, vec![1]);
+        s.step(Step::Down);
+        assert_eq!(s.open, vec![1], "groups are not rows");
+        s.step(Step::Right);
+        assert_eq!(s.open, vec![1, 5]);
+        s.step(Step::Down);
+        assert_eq!(s.open, vec![1, 6]);
+        s.step(Step::Right);
+        assert_eq!(s.open, vec![1, 6], "a file has no column");
+        s.step(Step::Left);
+        s.step(Step::Up);
+        assert_eq!(s.open, vec![2]);
+        s.step(Step::Left);
+        s.step(Step::Left);
+        assert_eq!(s.open, Vec::<NodeId>::new());
+        // A run of key presses is a single step.
+        assert!(s.go_history(false));
+        assert_eq!(s.open, vec![2]);
+        assert!(!s.can_go(false));
     }
 
     #[test]

@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 pub type NodeId = u32;
 pub const NO_NODE: NodeId = u32::MAX;
+/// Most items one scan keeps, which bounds its memory to a few gigabytes
+/// whatever the scanned tree looks like.
+pub const MAX_NODES: usize = 40_000_000;
 
 pub const F_DIR: u8 = 1;
 pub const F_HIDDEN: u8 = 1 << 1;
@@ -67,6 +70,9 @@ pub struct Tree {
     pub generation: u64,
     /// Folders that could not be listed, plus entries that could not be read.
     pub denied_dirs: u32,
+    /// (device, inode) each folder had when it was scanned, where the system
+    /// has them: tells a folder from another one put in its place since.
+    pub dir_ids: std::collections::HashMap<NodeId, (u64, u64)>,
 }
 
 impl Tree {
@@ -82,7 +88,7 @@ impl Tree {
             items: 0,
             flags: F_DIR,
         };
-        Tree { nodes: vec![root_node], generation: 1, denied_dirs: 0 }
+        Tree { nodes: vec![root_node], generation: 1, denied_dirs: 0, dir_ids: Default::default() }
     }
 
     pub fn root(&self) -> NodeId {
@@ -101,8 +107,8 @@ impl Tree {
     /// Appends the entries of `parent` and propagates sizes to all ancestors.
     /// Returns the id of the first inserted child.
     pub fn add_children(&mut self, parent: NodeId, mut entries: Vec<Entry>) -> NodeId {
-        // Node ids are 32-bit; past that the rest of the folder is reported as unread.
-        let room = (NO_NODE as usize - 1).saturating_sub(self.nodes.len());
+        // Past the limit the rest of the folder is reported as unread.
+        let room = MAX_NODES.saturating_sub(self.nodes.len());
         if entries.len() > room {
             entries.truncate(room);
             self.denied_dirs = self.denied_dirs.saturating_add(1);
@@ -144,6 +150,12 @@ impl Tree {
         }
         self.generation += 1;
         start
+    }
+
+    /// A folder whose content the scan does not know: another volume, or a
+    /// folder that could not be read completely.
+    pub fn unscanned(&self, id: NodeId) -> bool {
+        self.nodes[id as usize].flags & (F_OTHER_FS | F_DENIED) != 0
     }
 
     pub fn mark_denied(&mut self, id: NodeId) {
@@ -295,7 +307,7 @@ impl Tree {
 
     /// True when the node or one of its ancestors was removed.
     pub fn is_gone(&self, id: NodeId) -> bool {
-        self.nodes[id as usize].flags & F_DELETED != 0 || self.has_deleted_ancestor(id)
+        self.nodes[id as usize].is_deleted() || self.has_deleted_ancestor(id)
     }
 
     fn has_deleted_ancestor(&self, id: NodeId) -> bool {

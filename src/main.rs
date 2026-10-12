@@ -11,11 +11,15 @@ mod icons;
 #[cfg(target_os = "macos")]
 mod menu;
 mod ops;
+#[cfg(unix)]
+mod pinned;
 mod platform;
 mod scan;
 mod session;
 mod settings;
+mod swipe;
 mod theme;
+mod thumb;
 mod tree;
 mod util;
 mod views;

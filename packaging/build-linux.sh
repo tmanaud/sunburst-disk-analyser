@@ -42,11 +42,24 @@ exec "$HERE/usr/bin/sunburst-disk-analyser" "$@"
 RUN
 chmod +x "$APPDIR/AppRun"
 
-TOOL=dist/appimagetool
-if [ ! -x "$TOOL" ]; then
-    curl -fsSL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
-    chmod +x "$TOOL"
+# A fixed appimagetool release, checked against its known SHA-256 before it
+# runs, whether it was just downloaded or was already there.
+TOOL_VERSION=1.9.1
+case "$ARCH" in
+    x86_64) TOOL_SHA256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 ;;
+    aarch64) TOOL_SHA256=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158 ;;
+    *) echo "error: no known appimagetool checksum for $ARCH" >&2; exit 1 ;;
+esac
+TOOL="dist/appimagetool-$TOOL_VERSION-$ARCH"
+if [ ! -f "$TOOL" ]; then
+    curl -fsSL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/$TOOL_VERSION/appimagetool-$ARCH.AppImage"
 fi
+if ! echo "$TOOL_SHA256  $TOOL" | sha256sum -c - >/dev/null; then
+    echo "error: $TOOL does not match its expected checksum, not running it" >&2
+    rm -f "$TOOL"
+    exit 1
+fi
+chmod +x "$TOOL"
 ARCH="$ARCH" "$TOOL" --appimage-extract-and-run "$APPDIR" "dist/Sunburst-Disk-Analyser-$VERSION-linux-$ARCH.AppImage"
 rm -rf "$APPDIR"
 echo "Built dist/Sunburst-Disk-Analyser-$VERSION-linux-$ARCH.{tar.gz,AppImage}"

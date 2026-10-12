@@ -10,17 +10,17 @@ One native binary per platform, for **macOS**, **Windows** and **Linux**. No ins
 | --- | --- |
 | ![Columns](docs/screenshots/columns.png) | ![Biggest files](docs/screenshots/biggest-files.png) |
 
-| Review before removing | Light appearance |
+| Review before removing | Dark appearance |
 | --- | --- |
-| ![Review](docs/screenshots/review.png) | ![Light](docs/screenshots/light.png) |
+| ![Review](docs/screenshots/review.png) | ![Dark](docs/screenshots/dark.png) |
 
 The screenshots show built-in sample data (`--demo`), not a real disk.
 
 ## Features
 
 - **Fast parallel scan** with live results while it runs; stop it at any time. A 74 GB folder with about 590,000 files took 2.5 s on an Apple Silicon laptop SSD.
-- **Sunburst chart**: one ring per folder level, hover a segment for its size, file count and date, click to select it, double-click to dive in, click the centre to go back up.
-- **Folders Outline**: size-sorted columns; click a folder to open it in the next column. Tiny and hidden items are grouped so the big ones stand out.
+- **Sunburst chart**: one ring per folder level, centred on the folder that holds the selection; hover a segment for its size, file count and date, click it to select it, click the centre to go back up.
+- **Folders Outline**: size-sorted columns, as in a column file browser; click a folder to open it in the next column, click a file for a preview pane with a thumbnail (pictures everywhere, videos and PDFs on macOS) and double-click it to open it. Scroll sideways to see the earlier columns; at their edge a two-finger swipe goes back or forward, as do the side buttons of a mouse and ⌘[ / ⌘] (Ctrl on Windows and Linux). The arrow keys walk the columns. Tiny and hidden items are grouped so the big ones stand out.
 - **Biggest Files**: the largest files of the whole scan in one list.
 - **Search by name** in the scanned items.
 - **Select, review, then act**: tick items, check the list, then move them to the Trash, or move or copy them to another folder. Nothing is deleted permanently and nothing is overwritten.
@@ -65,16 +65,22 @@ sunburst-disk-analyser --demo          show sample data
 - **macOS and Linux**: space allocated on disk, so sparse files and iCloud files that are not downloaded count for what they really use. A file with several hard links is counted once. The scan stays on the scanned file system and does not follow symbolic links.
 - **Windows**: file length; OneDrive online-only files count as zero. Junctions and symbolic links are not followed.
 - Scanning never downloads cloud-only files.
+- A scan keeps at most 40 million items, and 4 million per folder; beyond that the folder is flagged as partly unread rather than exhausting memory.
 - On APFS, clones and snapshots share blocks, so the sum of your files can differ from what the system reports as used. When a whole disk is scanned, the difference appears as **Other used space**.
 
 ## Safety
 
-- Remove means **move to the Trash / Recycle Bin**. Space is freed when you empty it.
-- Volume roots, your home folder, its standard folders and operating system folders cannot be selected. Hidden items are protected until you allow them in Settings.
-- Every item is checked again right before it is touched; an item that disappeared or was replaced since the review is skipped and reported.
-- Move and copy never overwrite: on a name clash the new item gets a numbered name. A copy that fails part-way leaves nothing behind.
+- Remove means **move to the Trash / Recycle Bin**. Space is freed when you empty it. Where there is no Trash to move to, the item stays in place and the app says so; it never deletes for good instead:
+  - **Linux**: an item goes to the Trash of its own volume (your home Trash, or the volume's `.Trash-<uid>` folder), with a rename. If that folder cannot be used, for instance on a share whose root you cannot write to, the removal is refused.
+  - **Windows**: only internal drives have a Recycle Bin. Removal is refused on network shares and removable drives, where Windows would delete permanently.
+- Volume roots, your home folder, its standard folders and operating system folders cannot be selected. Hidden items are protected until you allow them in Settings. Other volumes mounted inside the scanned folder and folders that could not be read are listed but cannot be selected, since the scan does not know what they contain.
+- Every item is checked again right before it is touched, against what the scan recorded and against what you reviewed: a file must be the same file with the same size and date, a folder must be the same folder (on Windows a folder is matched by name only). An item that disappeared, was replaced or, for a file, was modified in between is skipped and reported; scan again to act on it. A folder is handled with everything it contains at that moment: files added to it after the scan go with it.
+- Move and copy never overwrite: on a name clash the new item gets a numbered name. On file systems without an atomic "rename unless it exists" (FAT, exFAT, some network shares) the name is reserved first, so the guarantee holds there too.
+- A copy is built in a private folder inside the destination and only appears under its name once complete. Files keep restricted permissions from the first byte. A copy that fails or is stopped part-way leaves nothing behind, and **Stop** takes effect within the item being copied.
+- On macOS and Linux, scans, copies and moves open every folder through its parent and never through a symbolic link, so a folder swapped for a link while the app works cannot redirect it. A copy stays on the volume of the item being copied.
 - **Move** works within one volume. To move something to another disk, copy it, check the copy, then remove the original: the app will not delete the source of a copy on its own.
-- These checks narrow, but cannot fully close, the window in which another program changes a file between the check and the operation.
+- These checks narrow, but cannot fully close, the window in which another program changes a file between the check and the operation. On Windows, and for the final step of a removal on macOS, items are addressed by path, so that window is wider there.
+- The CSV report and the settings file are written aside and renamed into place: an existing file is replaced as a whole or not at all.
 
 ## Known limits
 
