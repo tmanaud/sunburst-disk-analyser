@@ -22,6 +22,8 @@ pub struct ScanHandle {
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     elapsed_ms: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    progress: Arc<AtomicU64>,
 }
 
 impl ScanHandle {
@@ -41,6 +43,15 @@ impl ScanHandle {
             self.started.elapsed()
         }
     }
+    /// Space taken by the files found so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    /// Share of the folder tree that has been read, 0 to 1. The total is not
+    /// known beforehand, so this is an estimate: see [`WHOLE`].
+    pub fn progress(&self) -> f32 {
+        (self.progress.load(Ordering::Relaxed) as f64 / WHOLE as f64) as f32
+    }
     /// A handle around an already complete tree (demo data, tests).
     pub fn finished(tree: Tree) -> Self {
         ScanHandle {
@@ -50,12 +61,20 @@ impl ScanHandle {
             cancel: Arc::new(AtomicBool::new(false)),
             done: Arc::new(AtomicBool::new(true)),
             elapsed_ms: Arc::new(AtomicU64::new(0)),
+            bytes: Arc::new(AtomicU64::new(0)),
+            progress: Arc::new(AtomicU64::new(WHOLE)),
         }
     }
 }
 
-/// A folder to read, with the (device, inode) its parent listed it under.
-type Job = (NodeId, PathBuf, Option<(u64, u64)>);
+/// Progress is counted in shares of the scan. The scanned location holds the
+/// whole, every folder splits its share equally between its subfolders, and
+/// a share counts as done once the folder holding it has been read.
+const WHOLE: u64 = 1 << 62;
+
+/// A folder to read, with the (device, inode) its parent listed it under and
+/// its share of the scan.
+type Job = (NodeId, PathBuf, Option<(u64, u64)>, u64);
 
 struct Shared {
     tree: Arc<RwLock<Tree>>,
@@ -65,6 +84,8 @@ struct Shared {
     pending: AtomicUsize,
     cancel: Arc<AtomicBool>,
     entries: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    progress: Arc<AtomicU64>,
     /// (device, inode) of multiply linked files already counted.
     #[cfg_attr(not(unix), allow(dead_code))]
     links: Mutex<HashSet<(u64, u64)>>,
@@ -115,6 +136,8 @@ pub fn start_scan(root: PathBuf) -> ScanHandle {
     let done = Arc::new(AtomicBool::new(false));
     let entries = Arc::new(AtomicU64::new(0));
     let elapsed_ms = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(AtomicU64::new(0));
+    let progress = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
     if let Ok(m) = fs::metadata(&root) {
@@ -123,11 +146,13 @@ pub fn start_scan(root: PathBuf) -> ScanHandle {
 
     let shared = Arc::new(Shared {
         tree: tree.clone(),
-        queue: Mutex::new(vec![(0, root.clone(), None)]),
+        queue: Mutex::new(vec![(0, root.clone(), None, WHOLE)]),
         cv: Condvar::new(),
         pending: AtomicUsize::new(1),
         cancel: cancel.clone(),
         entries: entries.clone(),
+        bytes: bytes.clone(),
+        progress: progress.clone(),
         links: Mutex::new(HashSet::new()),
         dirs: Mutex::new(HashSet::new()),
         policy: Policy::for_root(&root),
@@ -156,7 +181,7 @@ pub fn start_scan(root: PathBuf) -> ScanHandle {
         })
         .expect("spawn scan supervisor");
 
-    ScanHandle { tree, entries, started, cancel, done, elapsed_ms }
+    ScanHandle { tree, entries, started, cancel, done, elapsed_ms, bytes, progress }
 }
 
 fn worker(s: &Shared) {
@@ -177,7 +202,8 @@ fn worker(s: &Shared) {
                 s.cv.wait_for(&mut q, Duration::from_millis(50));
             }
         };
-        scan_dir(s, job.0, &job.1, job.2);
+        let handed_on = scan_dir(s, job.0, &job.1, job.2, job.3);
+        s.progress.fetch_add(job.3 - handed_on, Ordering::Relaxed);
         if s.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             s.cv.notify_all();
         }
@@ -278,10 +304,12 @@ fn list(s: &Shared, path: &Path, _expected: Option<(u64, u64)>) -> Option<(Vec<F
     Some((found, complete))
 }
 
-fn scan_dir(s: &Shared, id: NodeId, path: &Path, expected: Option<(u64, u64)>) {
+/// Reads one folder into the tree and queues its subfolders. Returns the part
+/// of `share` handed on to them.
+fn scan_dir(s: &Shared, id: NodeId, path: &Path, expected: Option<(u64, u64)>, share: u64) -> u64 {
     let Some((found, complete)) = list(s, path, expected) else {
         s.tree.write().mark_denied(id);
-        return;
+        return 0;
     };
     let mut entries: Vec<Entry> = Vec::with_capacity(found.len());
     let mut subdirs: Vec<(usize, PathBuf, (u64, u64))> = Vec::new();
@@ -322,12 +350,13 @@ fn scan_dir(s: &Shared, id: NodeId, path: &Path, expected: Option<(u64, u64)>) {
         entries.push(Entry { name: f.name, size, mtime: f.mtime, flags });
     }
     s.entries.fetch_add(entries.len() as u64, Ordering::Relaxed);
+    s.bytes.fetch_add(entries.iter().map(|e| e.size).sum(), Ordering::Relaxed);
     if !complete {
         // Part of the folder is missing from the results: report it.
         s.tree.write().mark_denied(id);
     }
     if entries.is_empty() {
-        return;
+        return 0;
     }
     let start = {
         let mut tree = s.tree.write();
@@ -335,15 +364,19 @@ fn scan_dir(s: &Shared, id: NodeId, path: &Path, expected: Option<(u64, u64)>) {
         tree.dir_ids.extend(dir_ids.into_iter().map(|(i, ident)| (start + i as u32, ident)));
         start
     };
-    if !subdirs.is_empty() {
-        s.pending.fetch_add(subdirs.len(), Ordering::AcqRel);
-        let mut q = s.queue.lock();
-        for (i, p, identity) in subdirs {
-            q.push((start + i as u32, p, cfg!(unix).then_some(identity)));
-        }
-        drop(q);
-        s.cv.notify_all();
+    if subdirs.is_empty() {
+        return 0;
     }
+    let count = subdirs.len() as u64;
+    let each = share / count;
+    s.pending.fetch_add(subdirs.len(), Ordering::AcqRel);
+    let mut q = s.queue.lock();
+    for (i, p, identity) in subdirs {
+        q.push((start + i as u32, p, cfg!(unix).then_some(identity), each));
+    }
+    drop(q);
+    s.cv.notify_all();
+    each * count
 }
 
 fn same_filesystem(policy: &Policy, device: u64) -> bool {
@@ -451,6 +484,30 @@ mod tests {
         let mut f = fs::File::create(p).unwrap();
         f.write_all(&vec![7u8; bytes]).unwrap();
         f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn progress_ends_on_the_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in ["a/b/c", "a/d", "e", "f/g/h/i", "f/j"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        for i in 0..7 {
+            fs::create_dir_all(root.join(format!("a/b/n{i}/m"))).unwrap();
+        }
+        write(&root.join("a/b/c/file"), 5000);
+        let h = start_scan(root.to_path_buf());
+        let (mut last, t) = (0.0, Instant::now());
+        while !h.is_done() {
+            assert!(t.elapsed() < Duration::from_secs(20), "scan timed out");
+            let now = h.progress();
+            assert!((last..=1.0).contains(&now), "progress went from {last} to {now}");
+            last = now;
+        }
+        // Shares that do not divide evenly stay with the folder that split them.
+        assert_eq!(h.progress.load(Ordering::Relaxed), WHOLE);
+        assert!(h.bytes() >= 5000);
     }
 
     #[test]

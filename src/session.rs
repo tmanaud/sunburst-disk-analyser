@@ -141,6 +141,21 @@ pub struct Session {
 }
 
 impl Session {
+    /// Estimated share of the scan that is done, 0 to 1. A volume is measured
+    /// against its used space; the size of a folder is not known beforehand,
+    /// so it goes by the share of its folder tree that has been read.
+    pub fn progress(&self) -> f32 {
+        if self.scan.is_done() {
+            return 1.0;
+        }
+        // Only a finished scan is complete: a deep subtree can hold a share too small to show.
+        let estimate = match self.space {
+            Some(s) if s.total > s.free => (self.scan.bytes() as f64 / (s.total - s.free) as f64) as f32,
+            _ => self.scan.progress(),
+        };
+        estimate.min(0.99)
+    }
+
     pub fn new(name: String, scan: ScanHandle, space: Option<Space>) -> Session {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Session {

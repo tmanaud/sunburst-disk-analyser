@@ -36,6 +36,13 @@ fn buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
 }
 
+/// Version, license and home page of the project.
+fn project_info(ui: &mut Ui, dim: Color32) {
+    ui.label(RichText::new(format!("{} {}", t("Version"), env!("CARGO_PKG_VERSION"))).color(dim));
+    ui.label(RichText::new(t("Free and open-source software, MIT license.")).color(dim));
+    ui.hyperlink(env!("CARGO_PKG_REPOSITORY"));
+}
+
 impl App {
     pub fn draw_dialog(&mut self, ctx: &egui::Context) {
         if matches!(self.dialog, Dialog::None) {
@@ -43,6 +50,7 @@ impl App {
         }
         let pal = self.pal;
         let demo = self.opts.demo;
+        let disk_access = self.disk_access;
         let frame = egui::Frame::popup(&ctx.style())
             .fill(pal.popup)
             .stroke(egui::Stroke::new(1.0_f32, pal.popup_line))
@@ -259,6 +267,11 @@ impl App {
                         ui.end_row();
                     });
                     ui.add_space(6.0);
+                    let at_launch = egui::Checkbox::new(&mut s.scan_home_at_launch, t("Scan the home folder at launch"));
+                    settings_changed |= ui.add_enabled(disk_access, at_launch).changed();
+                    if !disk_access {
+                        ui.label(RichText::new(t("Requires Full Disk Access.")).color(pal.text_dim).font(regular(12.0)));
+                    }
                     settings_changed |= ui.checkbox(&mut s.show_selection_hint, t("Show hint for selected items")).changed();
                     settings_changed |= ui.checkbox(&mut s.allow_removing_hidden, t("Allow removing hidden files and folders")).changed();
                     ui.label(RichText::new(t("Removing hidden items is not recommended.")).color(pal.text_dim).font(regular(12.0)));
@@ -266,10 +279,12 @@ impl App {
                     ui.separator();
                     ui.label(RichText::new(t("Disk Access")).font(semibold(13.5)));
                     if cfg!(target_os = "macos") {
-                        ui.label(
-                            RichText::new(t("macOS protects some folders. Grant Full Disk Access to this app so that every folder can be measured."))
-                                .color(pal.text_dim),
-                        );
+                        let status = if disk_access {
+                            t("Full Disk Access is granted.")
+                        } else {
+                            t("macOS protects some folders. Grant Full Disk Access to this app so that every folder can be measured.")
+                        };
+                        ui.label(RichText::new(status).color(pal.text_dim));
                         if secondary(ui, t("Open System Settings")) && !demo {
                             platform::open_disk_access_settings();
                         }
@@ -290,12 +305,9 @@ impl App {
                 Dialog::About => {
                     ui.set_width(400.0);
                     title(ui, t("Sunburst Disk Analyser"));
-                    ui.label(RichText::new(format!("{} {}", t("Version"), env!("CARGO_PKG_VERSION"))).color(pal.text_dim));
-                    ui.add_space(4.0);
                     ui.label(t("See what takes up space on your disks with an interactive sunburst chart, then remove, move or copy what you no longer need."));
                     ui.add_space(4.0);
-                    ui.label(RichText::new(t("Free and open-source software, MIT license.")).color(pal.text_dim));
-                    ui.hyperlink(env!("CARGO_PKG_REPOSITORY"));
+                    project_info(ui, pal.text_dim);
                     buttons(ui, |ui| {
                         if primary(ui, t("Close"), pal.accent) {
                             outcome = Outcome::Close;
@@ -318,6 +330,10 @@ impl App {
                             ui.add(egui::Label::new(line).wrap());
                         });
                     }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(RichText::new(t("Sunburst Disk Analyser")).font(semibold(13.5)));
+                    project_info(ui, pal.text_dim);
                     buttons(ui, |ui| {
                         if primary(ui, t("Close"), pal.accent) {
                             outcome = Outcome::Close;

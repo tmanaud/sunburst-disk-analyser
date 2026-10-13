@@ -22,6 +22,11 @@ pub struct Settings {
     pub favorites: Vec<PathBuf>,
     pub sidebar_open: bool,
     pub show_chart: bool,
+    /// Scan the home folder when the app opens.
+    pub scan_home_at_launch: bool,
+    /// Width of an outline column, and of the flat lists, next to the chart.
+    pub column_width: f32,
+    pub list_width: f32,
     /// Set for demo and screenshot runs, which must not touch the saved preferences.
     #[serde(skip)]
     pub ephemeral: bool,
@@ -37,6 +42,9 @@ impl Default for Settings {
             favorites: Vec::new(),
             sidebar_open: true,
             show_chart: true,
+            scan_home_at_launch: true,
+            column_width: 264.0,
+            list_width: 320.0,
             ephemeral: false,
         }
     }
@@ -64,6 +72,13 @@ impl Settings {
         }
         let mut settings: Settings = serde_json::from_slice(&bytes).ok()?;
         settings.favorites.truncate(MAX_FAVORITES);
+        // The views clamp the widths to the window; this only discards nonsense such as NaN.
+        let default = Settings::default();
+        for (width, default) in [(&mut settings.column_width, default.column_width), (&mut settings.list_width, default.list_width)] {
+            if !(50.0..=10_000.0).contains(width) {
+                *width = default;
+            }
+        }
         Some(settings)
     }
 
@@ -125,6 +140,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         }
+        std::fs::write(&file, br#"{"column_width": 1e30, "list_width": 400.0}"#).unwrap();
+        let loaded = Settings::load_from(&file).unwrap();
+        assert_eq!((loaded.column_width, loaded.list_width), (Settings::default().column_width, 400.0));
         std::fs::write(&file, vec![b' '; MAX_FILE_SIZE as usize + 1]).unwrap();
         assert!(Settings::load_from(&file).is_none());
     }

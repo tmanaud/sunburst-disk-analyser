@@ -22,6 +22,9 @@ const ROW_H: f32 = 32.0;
 const FLAT_ROW_H: f32 = 46.0;
 const COL_W: f32 = 264.0;
 const FLAT_W: f32 = 320.0;
+/// Narrowest a pane edge can be dragged to.
+const MIN_COL_W: f32 = 150.0;
+const MIN_FLAT_W: f32 = 220.0;
 /// Seconds the columns take to slide to a newly opened one.
 const SLIDE: f64 = 0.18;
 
@@ -56,6 +59,8 @@ struct Strip {
     nav: (u64, u64),
     path: Vec<NodeId>,
     offset: f32,
+    /// Column width the offset was measured with.
+    col_w: f32,
     /// Running slide to the last column: where and when it started.
     slide: Option<(f32, f64)>,
 }
@@ -495,11 +500,17 @@ impl App {
         let flat = s.search_open || s.tab == Tab::Biggest;
         let chart_min = if self.settings.show_chart { 300.0 } else { 0.0 };
         let lists_right;
+        // Pane edges that can be dragged, drawn last so that they win over what they overlap.
+        let mut grips: Vec<(egui::Id, f32)> = Vec::new();
+        // Width of a pane, how far it can go, and the width a double-click on an edge brings back.
+        let (w, min, max, default);
         if flat {
-            let w = if self.settings.show_chart { FLAT_W.min(rect.width() - chart_min).max(220.0) } else { rect.width() };
+            (min, max, default) = (MIN_FLAT_W, (rect.width() - chart_min).max(MIN_FLAT_W), FLAT_W);
+            w = if self.settings.show_chart { self.settings.list_width.clamp(min, max) } else { rect.width() };
             let list = Rect::from_min_size(rect.min, vec2(w, rect.height()));
             self.flat_list(ui, list, s, acts);
             lists_right = list.right();
+            grips.push((ui.id().with("list-grip"), list.right()));
         } else {
             // As many columns as fit while the chart keeps a fair share; the others scroll sideways.
             let room = if self.settings.show_chart { rect.width() - chart_min.max(rect.width() * 0.42) } else { rect.width() };
@@ -507,10 +518,18 @@ impl App {
             let file = s.selected_file();
             let panes = s.columns.len() + file.is_some() as usize;
             let shown = ((room / COL_W).floor() as usize).clamp(1, panes.max(1));
-            let w = if self.settings.show_chart { COL_W.min(rect.width()) } else { rect.width() / shown as f32 };
+            // The count follows the standard width, so that dragging an edge never changes it.
+            (min, max, default) = (MIN_COL_W, ((rect.width() - chart_min) / shown as f32).max(MIN_COL_W), COL_W);
+            w = if self.settings.show_chart { self.settings.column_width.clamp(min, max) } else { rect.width() / shown as f32 };
             let strip = Rect::from_min_size(rect.min, vec2(w * shown as f32, rect.height()));
-            self.columns(ui, strip, w, file, s, acts);
+            let offset = self.columns(ui, strip, w, file, s, acts);
             lists_right = strip.right();
+            for i in 0..panes {
+                let x = strip.left() + (i + 1) as f32 * w - offset;
+                if x > strip.left() + 8.0 && x < strip.right() + 0.5 {
+                    grips.push((ui.id().with(("column-grip", i)), x));
+                }
+            }
         }
         ui.painter().line_segment(
             [pos2(lists_right, rect.top()), pos2(lists_right, rect.bottom())],
@@ -521,11 +540,46 @@ impl App {
             if area.width() > 120.0 {
                 self.chart(ui, area, s, acts);
             }
+            // Without the chart the panes fill the window and have no edge to drag.
+            // The bar that scrolls the columns sideways stays clear of their edges.
+            let held = if flat { rect } else { rect.with_max_y(rect.bottom() - 11.0) };
+            for (id, x) in grips {
+                if let Some((width, done)) = self.grip(ui, id, x, held, w, default) {
+                    acts.push(Action::PaneWidth { flat, width: width.clamp(min, max), done });
+                }
+            }
         }
     }
 
+    /// The edge of a pane at `x`, to drag sideways. Gives the pane width that keeps the edge under
+    /// the pointer, the panes being laid out from the left of `rect`, and whether the drag is over.
+    /// A double-click gives the `default` width.
+    fn grip(&self, ui: &mut Ui, id: egui::Id, x: f32, rect: Rect, width: f32, default: f32) -> Option<(f32, bool)> {
+        let resp = ui.interact(Rect::from_min_max(pos2(x - 2.0, rect.top()), pos2(x + 5.0, rect.bottom())), id, Sense::click_and_drag());
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            ui.painter().line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(2.0_f32, self.pal.accent));
+        }
+        if resp.double_clicked() {
+            return Some((default, true));
+        }
+        if !resp.dragged() && !resp.drag_stopped() {
+            return None;
+        }
+        let Some(pointer) = resp.interact_pointer_pos().map(|p| p.x) else { return Some((width, resp.drag_stopped())) };
+        if resp.drag_started() {
+            // How many widths the edge is from the left, and where on the grip the pointer took it.
+            let pressed = ui.input(|i| i.pointer.press_origin()).map_or(pointer, |p| p.x);
+            let held = (((x - rect.left()) / width).max(0.2), pressed - x);
+            ui.data_mut(|d| d.insert_temp(id, held));
+        }
+        let (widths, grab): (f32, f32) = ui.data(|d| d.get_temp(id))?;
+        Some(((pointer - grab - rect.left()) / widths, resp.drag_stopped()))
+    }
+
     /// The outline: one column per opened folder, sliding to the last one after each move.
-    fn columns(&self, ui: &mut Ui, strip: Rect, col_w: f32, file: Option<NodeId>, s: &Session, acts: &mut Vec<Action>) {
+    /// Returns how far the columns are scrolled sideways.
+    fn columns(&self, ui: &mut Ui, strip: Rect, col_w: f32, file: Option<NodeId>, s: &Session, acts: &mut Vec<Action>) -> f32 {
         let total = (s.columns.len() + file.is_some() as usize) as f32 * col_w;
         let end = (total - strip.width()).max(0.0);
         let id = ui.id().with("columns");
@@ -542,6 +596,15 @@ impl App {
             state.path = s.open.clone();
         }
         let mut area = egui::ScrollArea::horizontal().id_salt("columns").auto_shrink([false, false]).drag_to_scroll(false);
+        if state.col_w > 0.0 && state.col_w != col_w {
+            // Columns of another width keep the same ones in sight.
+            state.offset *= col_w / state.col_w;
+            area = area.horizontal_scroll_offset(state.offset.min(end));
+            if let Some((from, _)) = &mut state.slide {
+                *from *= col_w / state.col_w;
+            }
+        }
+        state.col_w = col_w;
         if let Some((from, start)) = state.slide {
             let t = (((now - start) / SLIDE) as f32).clamp(0.0, 1.0);
             area = area.horizontal_scroll_offset(from + (end - from) * (1.0 - (1.0 - t).powi(3)));
@@ -573,6 +636,7 @@ impl App {
             d.insert_temp(egui::Id::new("strip-scroll"), seen);
             d.insert_temp(id, state);
         });
+        seen.offset
     }
 
     /// The pane after the columns for a selected file: thumbnail, details and what to do with it.
@@ -1071,9 +1135,19 @@ impl App {
                 acts.push(Action::Cmd(Cmd::Stop));
             }
             let n = s.scan.entries.load(std::sync::atomic::Ordering::Relaxed);
-            let text = tf("Scanning… {} items found", &[&util::fmt_count(n)]);
+            // Eased, so that a large folder finishing does not make the bar jump.
+            let done = ui.ctx().animate_value_with_time(ui.id().with(("scan-progress", s.scan.started)), s.progress(), 0.4);
+            let text = format!("{}  ·  {}%", tf("Scanning… {} items found", &[&util::fmt_count(n)]), (done * 100.0).floor());
             let text = widgets::fit_end(ui, &text, &regular(13.0), text_room);
-            ui.painter().text(pos2(left, cy), Align2::LEFT_CENTER, text, regular(13.0), pal.text_dim);
+            ui.painter().text(pos2(left, cy - 9.0), Align2::LEFT_CENTER, text, regular(13.0), pal.text_dim);
+            let track = Rect::from_min_size(pos2(left, cy + 7.0), vec2(text_room.clamp(0.0, 340.0), 5.0));
+            let rad = CornerRadius::same(3);
+            ui.painter().rect_filled(track, rad, pal.control);
+            ui.painter().rect_filled(Rect::from_min_size(track.min, vec2(track.width() * done, track.height())), rad, pal.accent);
+            let area = Rect::from_min_max(pos2(left, cy - 20.0), pos2(track.right(), cy + 18.0));
+            let secs = format!("{:.0}", s.scan.elapsed().as_secs_f32());
+            ui.interact(area, ui.id().with("scan-progress"), Sense::hover())
+                .on_hover_text(tf("Estimated progress. {} measured in {} s.", &[&util::fmt_size(s.scan.bytes()), &secs]));
             return;
         }
 

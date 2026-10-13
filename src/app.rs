@@ -86,6 +86,9 @@ pub enum Action {
     Review,
     ShowDenied,
     DismissHint,
+    /// A pane edge was dragged: new width of the outline columns, or of the flat lists.
+    /// `done` ends the drag.
+    PaneWidth { flat: bool, width: f32, done: bool },
 }
 
 pub struct ReviewItem {
@@ -155,6 +158,8 @@ pub struct App {
     applied_dark: Option<bool>,
     applied_lang: Option<i18n::Lang>,
     volumes_checked: Instant,
+    /// Whether protected folders can be read without a system prompt, see `platform::has_full_disk_access`.
+    pub disk_access: bool,
     frame: u64,
     shot_requested: bool,
 }
@@ -197,6 +202,7 @@ impl App {
             applied_dark: None,
             applied_lang: None,
             volumes_checked: Instant::now(),
+            disk_access: opts.demo || platform::has_full_disk_access(),
             frame: 0,
             shot_requested: false,
         };
@@ -210,6 +216,10 @@ impl App {
             if let Some(path) = opts.scan.clone().filter(|p| p.is_dir()) {
                 let path = std::fs::canonicalize(&path).map(|p| ops::plain(&p)).unwrap_or(path);
                 app.scan_folder(path);
+            } else if app.settings.scan_home_at_launch && app.disk_access && app.home.is_some() {
+                // Without full access, an unrequested scan would open one system prompt per protected folder.
+                app.current = app.home.clone();
+                app.start_scan();
             }
         }
         app
@@ -562,7 +572,10 @@ impl App {
                     s.deselect_all();
                 }
             }
-            Cmd::Settings => self.dialog = Dialog::Settings,
+            Cmd::Settings => {
+                self.disk_access = self.opts.demo || platform::has_full_disk_access();
+                self.dialog = Dialog::Settings;
+            }
             Cmd::About => self.dialog = Dialog::About,
             Cmd::Help => self.dialog = Dialog::Help,
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -614,6 +627,16 @@ impl App {
                 };
             }
             Action::DismissHint => self.hint_dismissed = true,
+            Action::PaneWidth { flat, width, done } => {
+                if flat {
+                    self.settings.list_width = width;
+                } else {
+                    self.settings.column_width = width;
+                }
+                if done {
+                    self.settings.save();
+                }
+            }
             other => {
                 let mut error = None;
                 let Some(s) = self.session_mut() else { return };
@@ -961,5 +984,106 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.drive_screenshot(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Item;
+    use egui::{pos2, Event, PointerButton, Pos2};
+
+    /// The app on demo data, driven frame by frame without a window.
+    struct Bench {
+        app: App,
+        ctx: egui::Context,
+        time: f64,
+    }
+
+    impl Bench {
+        fn new() -> Bench {
+            let ctx = egui::Context::default();
+            let app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Options { demo: true, ..Options::default() });
+            let mut bench = Bench { app, ctx, time: 0.0 };
+            bench.frames(3, vec![]);
+            bench
+        }
+
+        fn frames(&mut self, count: usize, events: Vec<Event>) {
+            let mut events = Some(events);
+            for _ in 0..count {
+                self.time += 1.0 / 60.0;
+                let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                let input = egui::RawInput { screen_rect: Some(screen), time: Some(self.time), events: events.take().unwrap_or_default(), ..Default::default() };
+                let (app, ctx) = (&mut self.app, self.ctx.clone());
+                let _ = ctx.run(input, |ctx| {
+                    if let Some(s) = app.session_mut() {
+                        s.refresh();
+                    }
+                    let mut actions = Vec::new();
+                    app.draw(ctx, &mut actions);
+                    for action in actions {
+                        app.apply(action, ctx);
+                    }
+                });
+            }
+        }
+
+        fn button(&mut self, pos: Pos2, pressed: bool) {
+            self.frames(1, vec![Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() }]);
+        }
+
+        fn drag(&mut self, from: Pos2, by: f32) {
+            self.frames(2, vec![Event::PointerMoved(from)]);
+            self.button(from, true);
+            for step in 1..=8 {
+                self.frames(1, vec![Event::PointerMoved(pos2(from.x + by * step as f32 / 8.0, from.y))]);
+            }
+            self.button(pos2(from.x + by, from.y), false);
+            self.frames(2, vec![]);
+        }
+
+        fn strip(&self) -> egui::Rect {
+            crate::views::strip_scroll(&self.ctx).rect
+        }
+    }
+
+    #[test]
+    fn dragging_a_column_edge_resizes_the_columns() {
+        let mut bench = Bench::new();
+        let strip = bench.strip();
+        assert_eq!(strip.width(), 264.0, "one column of the standard width");
+
+        // The edge follows the pointer, wherever on the grip it was taken.
+        bench.drag(pos2(strip.right() + 3.0, 400.0), 40.0);
+        assert_eq!(bench.app.settings.column_width, 304.0);
+        assert_eq!(bench.strip().width(), 304.0);
+
+        // With two columns in sight, their common edge with the chart moves both.
+        let first = bench.app.session().unwrap().columns[0].items.iter().find_map(|i| if let Item::Row(r) = i { Some(r.id) } else { None }).unwrap();
+        bench.app.apply(Action::RowClick { col: 0, id: first }, &bench.ctx.clone());
+        bench.frames(30, vec![]);
+        let strip = bench.strip();
+        assert_eq!(strip.width(), 608.0);
+        bench.drag(pos2(strip.right(), 400.0), -80.0);
+        assert_eq!(bench.app.settings.column_width, 264.0);
+        // So does the edge between them.
+        bench.drag(pos2(bench.strip().left() + 264.0, 400.0), -64.0);
+        assert_eq!(bench.app.settings.column_width, 200.0);
+        assert_eq!(bench.strip().width(), 400.0);
+
+        // Neither the columns nor the chart can be squeezed out.
+        bench.drag(pos2(bench.strip().left() + 200.0, 400.0), -190.0);
+        assert_eq!(bench.app.settings.column_width, 150.0);
+        bench.drag(pos2(bench.strip().right(), 400.0), 900.0);
+        let strip = bench.strip();
+        assert!(strip.width() > 608.0 && 1200.0 - strip.right() > 300.0, "{strip:?}");
+
+        // A double-click on an edge brings the standard width back.
+        let edge = pos2(strip.right(), 400.0);
+        for pressed in [true, false, true, false] {
+            bench.button(edge, pressed);
+        }
+        assert_eq!(bench.app.settings.column_width, 264.0);
     }
 }

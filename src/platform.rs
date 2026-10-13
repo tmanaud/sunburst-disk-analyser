@@ -209,6 +209,24 @@ pub fn preview_label() -> &'static str {
     }
 }
 
+/// Whether macOS lets this app into the folders it protects (Full Disk
+/// Access). There is no system call to ask, so this opens a file that only
+/// this right unlocks, which answers without showing a prompt. Only a refusal
+/// counts as no access: a missing file says nothing. Always true on the other
+/// systems.
+pub fn has_full_disk_access() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = dirs::home_dir() else { return true };
+        match std::fs::File::open(home.join("Library/Application Support/com.apple.TCC/TCC.db")) {
+            Err(e) => e.kind() != std::io::ErrorKind::PermissionDenied,
+            Ok(_) => true,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
 /// Opens the system page where disk access can be granted (macOS only).
 pub fn open_disk_access_settings() {
     #[cfg(target_os = "macos")]
