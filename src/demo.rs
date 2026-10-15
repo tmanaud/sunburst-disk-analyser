@@ -1,8 +1,11 @@
 //! Synthetic, deterministic disk content used for screenshots (`--demo`),
 //! so that no real file name ever appears in the documentation.
 
+use crate::scan::{Feed, ScanHandle};
 use crate::tree::*;
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 struct Rng(u64);
 
@@ -43,7 +46,9 @@ fn split(rng: &mut Rng, total: u64, parts: usize) -> Vec<u64> {
     weights.iter().map(|w| ((w / sum) * total as f64) as u64).collect()
 }
 
-fn fill(tree: &mut Tree, rng: &mut Rng, dir: NodeId, size: u64, depth: u32) {
+/// Fills `dir` with `size` bytes of made-up content, plus the `extra` files.
+fn fill(tree: &mut Tree, rng: &mut Rng, dir: NodeId, size: u64, depth: u32, extra: &[(&str, u64)]) {
+    let size = size - extra.iter().map(|e| e.1).sum::<u64>();
     let n_dirs = if depth >= 6 || size < 300_000_000 { 0 } else { rng.range(2, 5) as usize };
     let n_files = rng.range(2, 6) as usize;
     let dir_share = if n_dirs == 0 { 0 } else { (size as f64 * (0.55 + rng.unit() * 0.35)) as u64 };
@@ -61,13 +66,21 @@ fn fill(tree: &mut Tree, rng: &mut Rng, dir: NodeId, size: u64, depth: u32) {
         let name = if i < 3 { base.to_string() } else { format!("{}-{}", i, base) };
         entries.push(Entry { name: name.into(), size: s, mtime: BASE_TIME - rng.range(1, 900) as i64 * DAY, flags: 0 });
     }
+    for (name, s) in extra {
+        entries.push(Entry { name: (*name).into(), size: *s, mtime: BASE_TIME - 40 * DAY, flags: 0 });
+    }
     let first = tree.add_children(dir, entries);
     for (i, s) in dir_sizes.into_iter().enumerate() {
-        fill(tree, rng, first + i as u32, s, depth + 1);
+        fill(tree, rng, first + i as u32, s, depth + 1, &[]);
     }
 }
 
 pub const HOME_NAME: &str = "alex";
+
+/// A film with a picture for the preview pane: Big Buck Bunny,
+/// (c) copyright 2008 Blender Foundation, www.bigbuckbunny.org, CC BY 3.0.
+pub const MOVIE: &str = "Big Buck Bunny 4K.mov";
+const MOVIE_PICTURE: &str = "big-buck-bunny.jpg";
 
 pub fn home_path() -> PathBuf {
     PathBuf::from(if cfg!(windows) { "C:\\Users\\alex" } else { "/Users/alex" })
@@ -116,12 +129,81 @@ pub fn tree() -> Tree {
         })
         .collect();
     let first = tree.add_children(0, entries);
-    for (i, (_, size, flags)) in top.iter().enumerate() {
+    for (i, (name, size, flags)) in top.iter().enumerate() {
         if flags & F_DIR != 0 {
-            fill(&mut tree, &mut rng, first + i as u32, *size, 1);
+            let extra: &[(&str, u64)] = if *name == "Movies" { &[(MOVIE, 41_600_000_000)] } else { &[] };
+            fill(&mut tree, &mut rng, first + i as u32, *size, 1, extra);
         }
     }
     tree
+}
+
+/// The picture of a demo file, from the folder given with `--demo-media`.
+pub fn picture(media: &Path, file: &Path) -> Option<egui::ColorImage> {
+    if file.file_name()? != MOVIE {
+        return None;
+    }
+    let picture = image::open(media.join(MOVIE_PICTURE)).ok()?.to_rgba8();
+    let size = [picture.width() as usize, picture.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, &picture))
+}
+
+/// Plays the demo tree back as if it was being scanned, one folder at a time
+/// and level by level, for the recording of the README animation.
+pub struct Replay {
+    full: Tree,
+    feed: Feed,
+    /// Folders still to read: id in `full`, id in the scanned tree.
+    queue: VecDeque<(NodeId, NodeId)>,
+    folders: usize,
+    read: usize,
+}
+
+impl Replay {
+    pub fn start() -> (ScanHandle, Replay) {
+        let full = tree();
+        let folders = full.nodes.iter().filter(|n| n.is_dir()).count();
+        let (handle, feed) = ScanHandle::scripted(home_path());
+        handle.tree.write().nodes[0].mtime = BASE_TIME;
+        (handle, Replay { full, feed, queue: VecDeque::from([(0, 0)]), folders, read: 0 })
+    }
+
+    /// Reads folders until `share` of them, 0 to 1, are read.
+    pub fn advance(&mut self, share: f64) {
+        let want = ((share.clamp(0.0, 1.0) * self.folders as f64).ceil() as usize).min(self.folders);
+        let mut tree = self.feed.tree.write();
+        while self.read < want {
+            let Some((from, to)) = self.queue.pop_front() else { break };
+            let entries = self
+                .full
+                .children(from)
+                .map(|id| {
+                    let n = self.full.node(id);
+                    Entry { name: n.name.to_os_string(), size: if n.is_dir() { 0 } else { n.size }, mtime: n.mtime, flags: n.flags }
+                })
+                .collect();
+            let start = tree.add_children(to, entries);
+            for (i, id) in self.full.children(from).enumerate() {
+                if self.full.node(id).is_dir() {
+                    self.queue.push_back((id, start + i as u32));
+                }
+            }
+            self.read += 1;
+        }
+        let (entries, bytes) = (tree.nodes.len() as u64 - 1, tree.node(0).size);
+        drop(tree);
+        self.feed.report(entries, bytes, self.read as f64 / self.folders as f64);
+    }
+
+    pub fn finish(&mut self, elapsed: Duration) {
+        self.advance(1.0);
+        self.feed.finish(elapsed);
+    }
+
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        self.read >= self.folders
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +216,20 @@ mod tests {
         assert_eq!(a.node(0).size, b.node(0).size);
         assert!(a.len() > 1000);
         assert!(a.node(0).size > 1_400_000_000_000);
+    }
+
+    #[test]
+    fn replay_ends_with_the_whole_tree() {
+        let full = super::tree();
+        let (handle, mut replay) = super::Replay::start();
+        replay.advance(0.3);
+        assert!(!replay.is_finished());
+        assert!(handle.tree.read().node(0).size < full.node(0).size);
+        replay.finish(std::time::Duration::from_millis(2400));
+        assert!(handle.is_done());
+        let tree = handle.tree.read();
+        assert_eq!(tree.len(), full.len());
+        assert_eq!(tree.node(0).size, full.node(0).size);
+        assert_eq!(handle.bytes(), full.node(0).size);
     }
 }

@@ -65,6 +65,44 @@ impl ScanHandle {
             progress: Arc::new(AtomicU64::new(WHOLE)),
         }
     }
+    /// A scan whose tree and counters are filled by the caller (demo recording).
+    pub fn scripted(root: PathBuf) -> (Self, Feed) {
+        let handle = ScanHandle::finished(Tree::new(root));
+        handle.done.store(false, Ordering::Release);
+        handle.progress.store(0, Ordering::Relaxed);
+        let feed = Feed {
+            tree: handle.tree.clone(),
+            entries: handle.entries.clone(),
+            done: handle.done.clone(),
+            elapsed_ms: handle.elapsed_ms.clone(),
+            bytes: handle.bytes.clone(),
+            progress: handle.progress.clone(),
+        };
+        (handle, feed)
+    }
+}
+
+/// The writing end of a [`ScanHandle::scripted`] scan.
+pub struct Feed {
+    pub tree: Arc<RwLock<Tree>>,
+    entries: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+    elapsed_ms: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    progress: Arc<AtomicU64>,
+}
+
+impl Feed {
+    /// Reports the counters; `progress` goes from 0 to 1.
+    pub fn report(&self, entries: u64, bytes: u64, progress: f64) {
+        self.entries.store(entries, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
+        self.progress.store((progress.clamp(0.0, 1.0) * WHOLE as f64) as u64, Ordering::Relaxed);
+    }
+    pub fn finish(&self, elapsed: Duration) {
+        self.elapsed_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
+        self.done.store(true, Ordering::Release);
+    }
 }
 
 /// Progress is counted in shares of the scan. The scanned location holds the

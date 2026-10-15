@@ -15,6 +15,7 @@ mod ops;
 #[cfg(unix)]
 mod pinned;
 mod platform;
+mod record;
 mod scan;
 mod session;
 mod settings;
@@ -37,6 +38,8 @@ Usage: sunburst-disk-analyser [OPTIONS] [FOLDER]
   --theme <light|dark>        Appearance for this run
   --demo                      Show built-in sample data instead of your disk
   --screenshot <scene> <png>  Render one scene to a PNG file and quit
+  --record <folder>           Record the README animation as PNG frames and quit
+  --demo-media <folder>       Pictures of the demo files (assets/demo)
   --size <WxH>                Window size in points
   --render-icon <png> [size]  Write the application icon and quit
   -h, --help                  Show this help
@@ -65,6 +68,13 @@ fn main() -> eframe::Result<()> {
                     opts.demo = true;
                 }
             }
+            "--record" => {
+                if let Some(out) = args.next() {
+                    opts.record = Some(PathBuf::from(out));
+                    opts.demo = true;
+                }
+            }
+            "--demo-media" => opts.media = args.next().map(PathBuf::from),
             "--size" => {
                 if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
                     if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {

@@ -407,6 +407,7 @@ impl App {
             let want = ((widest + 34.0) * 2.0).max(270.0);
             let seg = Rect::from_min_size(pos2(x, cy - 17.0), vec2(want.min(right - x - 20.0), 34.0));
             let selected = if s.tab == Tab::Outline { 0 } else { 1 };
+            crate::record::mark(ui.ctx(), || "tab:biggest".into(), pos2(seg.left() + seg.width() * 0.75, cy));
             match widgets::segmented(ui, seg, &labels, selected, pal) {
                 Some(0) => acts.push(Action::Cmd(Cmd::TabOutline)),
                 Some(1) => acts.push(Action::Cmd(Cmd::TabBiggest)),
@@ -927,6 +928,9 @@ impl App {
         let truncated = name != row.name;
         let ink = if dim { pal.text_faint } else { pal.text };
         ui.painter().text(pos2(name_x, r.center().y), Align2::LEFT_CENTER, name, regular(13.5), ink);
+        if let Some(c) = col {
+            crate::record::mark(ui.ctx(), || format!("row:{c}:{}", row.name), pos2(name_x + 40.0, r.center().y));
+        }
 
         if resp.hovered() || cb_resp.hovered() {
             acts.push(Action::Hover(row.id, false));
@@ -1076,6 +1080,12 @@ impl App {
             chart::add_segment(&mut mesh, &g, seg, chart::seg_color(l, seg, i, pal, checked));
         }
         p.add(Shape::mesh(mesh));
+        if crate::record::active(ui.ctx()) {
+            let tree = s.scan.tree.read();
+            for seg in l.segs.iter().filter(|seg| seg.kind == SegKind::Node) {
+                crate::record::mark(ui.ctx(), || format!("seg:{}", tree.node(seg.id).display_name()), g.anchor(seg));
+            }
+        }
 
         let hit = resp.hover_pos().map(|pos| chart::hit(l, &g, pos)).unwrap_or(Hit::None);
         let find = |id: NodeId| l.segs.iter().position(|x| x.kind == SegKind::Node && x.id == id);
@@ -1237,6 +1247,7 @@ impl App {
         let text_room = button.left() - left - 16.0;
         let Some(s) = session else {
             let enabled = self.current.is_some();
+            crate::record::mark(ui.ctx(), || "scan".into(), button.center());
             if widgets::button(ui, button, t("Start Scanning"), Btn::Primary, enabled, pal, semibold(15.5)).clicked() {
                 acts.push(Action::Cmd(Cmd::Scan));
             }

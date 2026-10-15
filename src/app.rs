@@ -23,6 +23,10 @@ pub struct Options {
     pub demo: bool,
     /// Render one scene to a PNG file and quit: `(scene, output)`.
     pub shot: Option<(String, PathBuf)>,
+    /// Record the README animation as PNG frames in this folder, then quit.
+    pub record: Option<PathBuf>,
+    /// Folder with the pictures of the demo files, see `demo::picture`.
+    pub media: Option<PathBuf>,
     /// Folder to scan right away.
     pub scan: Option<PathBuf>,
     pub lang: Option<String>,
@@ -163,6 +167,11 @@ pub struct App {
     pub disk_access: bool,
     frame: u64,
     shot_requested: bool,
+    recorder: Option<crate::record::Recorder>,
+    /// Demo scan being played back for the recording.
+    replay: Option<demo::Replay>,
+    /// Demo file whose picture was last looked for.
+    pictured: Option<PathBuf>,
 }
 
 impl App {
@@ -206,8 +215,16 @@ impl App {
             disk_access: opts.demo || platform::has_full_disk_access(),
             frame: 0,
             shot_requested: false,
+            recorder: None,
+            replay: None,
+            pictured: None,
         };
-        if opts.demo {
+        if let Some(dir) = &opts.record {
+            app.load_demo();
+            // The recording starts on the start screen.
+            app.sessions.clear();
+            app.recorder = Some(crate::record::Recorder::new(&cc.egui_ctx, dir.clone()));
+        } else if opts.demo {
             app.load_demo();
         } else {
             app.home = platform::home();
@@ -287,6 +304,12 @@ impl App {
 
     fn start_scan(&mut self) {
         let Some(loc) = self.current.clone() else { return };
+        if self.opts.record.is_some() {
+            let (handle, replay) = demo::Replay::start();
+            self.sessions.insert(loc.path, Session::new(demo::HOME_NAME.into(), handle, None));
+            self.replay = Some(replay);
+            return;
+        }
         if self.opts.demo {
             self.load_demo();
             return;
@@ -906,9 +929,10 @@ impl App {
         });
         if let Some(img) = image {
             let [w, h] = img.size;
+            let ppp = w as f32 / ctx.screen_rect().width();
             let saved = image::RgbaImage::from_raw(w as u32, h as u32, img.as_raw().to_vec())
                 .ok_or_else(|| "bad screenshot buffer".to_string())
-                .and_then(|i| i.save(&out).map_err(|e| e.to_string()));
+                .and_then(|i| crate::record::save_png(&crate::record::window_frame(&i, ppp), &out, false));
             if let Err(e) = saved {
                 eprintln!("screenshot failed: {e}");
             }
@@ -973,6 +997,15 @@ impl eframe::App for App {
         // The preview pane shows a thumbnail of the selected file.
         self.thumbs.poll(ctx);
         let previewed = self.session().and_then(|s| s.selected_file().map(|id| s.path_of(id)));
+        if let (Some(path), Some(media)) = (previewed.as_ref().filter(|_| self.opts.demo), &self.opts.media) {
+            if self.pictured.as_ref() != Some(path) {
+                self.pictured = Some(path.clone());
+                if let Some(picture) = demo::picture(media, path) {
+                    let texture = ctx.load_texture(path.to_string_lossy(), picture, egui::TextureOptions::LINEAR);
+                    self.thumbs.insert(path.clone(), texture);
+                }
+            }
+        }
         if let Some(path) = previewed.filter(|_| !self.opts.demo) {
             self.thumbs.want(ctx, &path);
         }
@@ -996,6 +1029,32 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.drive_screenshot(ctx);
+        if let Some(recorder) = &mut self.recorder {
+            recorder.after_frame(ctx);
+        }
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let Some(recorder) = &mut self.recorder else { return };
+        for effect in recorder.input(ctx, raw_input) {
+            match effect {
+                crate::record::Effect::Scan(share) => {
+                    if let Some(r) = &mut self.replay {
+                        r.advance(share);
+                    }
+                    // Shown at once, not when the refresh timer allows.
+                    if let Some(s) = self.session_mut() {
+                        s.mark_dirty();
+                    }
+                }
+                crate::record::Effect::ScanDone => {
+                    if let Some(r) = &mut self.replay {
+                        r.finish(Duration::from_secs(38));
+                    }
+                }
+                crate::record::Effect::Dark => self.settings.appearance = Appearance::Dark,
+            }
+        }
     }
 }
 

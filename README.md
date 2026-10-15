@@ -4,7 +4,10 @@ See what is filling up your disks. Sunburst Disk Analyser scans a disk or a fold
 
 One native binary per platform, for **macOS**, **Windows** and **Linux**. No installer, no account, no telemetry.
 
-![Overview](docs/screenshots/overview.png)
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="docs/screenshots/demo-still.png">
+  <img src="docs/screenshots/demo.webp" alt="Sunburst Disk Analyser scanning a home folder, opening the Movies folder, previewing a film, then showing the biggest files in the dark appearance">
+</picture>
 
 | Folders outline | Biggest files |
 | --- | --- |
@@ -14,7 +17,7 @@ One native binary per platform, for **macOS**, **Windows** and **Linux**. No ins
 | --- | --- |
 | ![Review](docs/screenshots/review.png) | ![Dark](docs/screenshots/dark.png) |
 
-The screenshots show built-in sample data (`--demo`), not a real disk.
+The animation and the screenshots show built-in sample data (`--demo`), not a real disk; the scan in the animation is sped up.
 
 ## Features
 
@@ -101,11 +104,13 @@ cargo run --release
 
 Packaged builds: `packaging/build-macos.sh`, `packaging/build-linux.sh`, `packaging/build-windows.ps1`. On Linux install `libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev` (or your distribution's equivalents) first.
 
-The screenshots are rendered by the app itself: `sunburst-disk-analyser --screenshot overview out.png`.
+The screenshots and the animation are rendered by the app itself from the sample data: `scripts/screenshots.sh` refreshes them all (macOS, needs `ffmpeg`). `scripts/release.sh <version>` refreshes them, runs the tests, then commits, tags and pushes a release.
 
 ## Credits
 
 Written in Rust with [egui](https://github.com/emilk/egui). Interface font: [Inter](https://rsms.me/inter/) (SIL Open Font License).
+
+The film picture in the animation is a resized frame of [Big Buck Bunny](https://peach.blender.org/), © 2008 Blender Foundation, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
 
 The workflow is inspired by Nektony's Disk Space Analyzer for macOS. This is an independent project with its own code, name and artwork; it is not affiliated with or endorsed by Nektony.
 
