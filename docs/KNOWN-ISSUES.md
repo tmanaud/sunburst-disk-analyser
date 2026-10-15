@@ -121,15 +121,18 @@ noted further down.
   time budget runs out (3 to 30 minutes, from the file size): a blocked
   network read cannot be interrupted. It never publishes anything once
   cancelled, and each attempt has its own partial file.
-- **Update publishing on file systems without hard links** (a Downloads
-  folder on FAT or exFAT) falls back to reserving the name, then renaming
-  over the reservation: a file another program writes under that exact
-  name in between would be replaced. Elsewhere the hard link cannot
-  replace anything.
+- **Update publishing** uses a hard link, or on file systems without
+  them an exclusive rename (`renamex_np`/`renameat2`/`MoveFileExW` without
+  replacement); where neither exists the download fails rather than risk
+  replacing a file. The exclusive rename on FAT/exFAT was not tried.
 - **Thumbnail programs** (ffmpeg, Quick Look) are stopped with their whole
   process group on Unix and their job object on Windows when they exceed
-  6 s. A process that leaves its group (`setsid`), or one started on
-  Windows in the instant before the job is assigned, escapes that.
+  6 s; the group is only signalled before the program is reaped, so its id
+  cannot have been reused. Not stopped: a process that leaves its group
+  (`setsid`), one started on Windows in the instant before the job is
+  assigned, and leftovers of a program that ended normally and no longer
+  hold its output. Without a job object a thumbnail is not attempted on
+  Windows. The Windows side has only been compiled, never run.
   ffmpeg only gets self-contained video formats (`-format_whitelist`) and
   local files (`-protocol_whitelist file`).
 - **Locally built binaries embed the build machine's home path** in panic

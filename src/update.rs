@@ -334,41 +334,70 @@ fn numbered(name: &str, n: u32) -> String {
     format!("{} ({n}){ext}", &name[..name.len() - ext.len()])
 }
 
-/// Puts `temp` into `dir` under the first free name. A hard link is made, which
-/// fails on an existing name instead of replacing it, even one that appeared
-/// a moment ago; `temp` itself is deleted by its owner afterwards.
+/// Puts `temp` into `dir` under the first free name, never replacing a file,
+/// even one that appeared a moment ago. A hard link is tried first, then a
+/// rename that the system refuses over an existing name (file systems
+/// without hard links); `temp` itself is deleted by its owner afterwards.
 fn publish(temp: &Path, dir: &Path, name: &str) -> io::Result<PathBuf> {
     for n in 1..1000 {
         let target = dir.join(numbered(name, n));
-        match std::fs::hard_link(temp, &target) {
+        let placed = std::fs::hard_link(temp, &target).or_else(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => Err(e),
+            _ => rename_no_replace(temp, &target),
+        });
+        match placed {
             Ok(()) => return Ok(target),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            // File systems without hard links (FAT, exFAT) take the next way.
-            Err(_) => return publish_by_rename(temp, dir, name),
+            Err(e) => return Err(e),
         }
     }
     Err(io::Error::from(io::ErrorKind::AlreadyExists))
 }
 
-/// Reserves the first free name, then renames over that reservation: an
-/// existing file is never replaced, though one written in between could be.
-fn publish_by_rename(temp: &Path, dir: &Path, name: &str) -> io::Result<PathBuf> {
-    for n in 1..1000 {
-        let target = dir.join(numbered(name, n));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-        return match std::fs::rename(temp, &target) {
-            Ok(()) => Ok(target),
-            Err(e) => {
-                let _ = std::fs::remove_file(&target);
-                Err(e)
-            }
-        };
+/// Renames `from` to `to`, failing with `AlreadyExists` rather than replacing `to`.
+#[cfg(target_os = "macos")]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: both strings are valid and NUL-terminated for the duration of the call.
+    match unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
     }
-    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: both strings are valid and NUL-terminated for the duration of the call.
+    match unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (from, to) = (wide(from), wide(to));
+    // Without MOVEFILE_REPLACE_EXISTING the move fails on an existing name.
+    // SAFETY: both strings are valid and NUL-terminated for the duration of the call.
+    match unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } {
+        0 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// What to do with the saved file, for this system.
@@ -494,6 +523,12 @@ mod tests {
         assert_eq!(saved, dir.path().join("App (2).dmg"));
         assert_eq!(std::fs::read(dir.path().join("App.dmg")).unwrap(), b"old");
         assert_eq!(std::fs::read(&saved).unwrap(), b"new");
+        // Without a hard link, the exclusive rename refuses existing names too.
+        let other = dir.path().join(".other.part");
+        std::fs::write(&other, b"other").unwrap();
+        assert_eq!(rename_no_replace(&other, &saved).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&saved).unwrap(), b"new");
+        rename_no_replace(&other, &dir.path().join("App (3).dmg")).unwrap();
         // The partial file belongs to its download, which deletes it.
         drop(Partial(temp.clone()));
         assert!(!temp.exists());

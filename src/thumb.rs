@@ -238,7 +238,12 @@ fn run(mut cmd: Command, limit: u64) -> Option<Vec<u8>> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn().ok()?;
-    let group = Group::of(&child);
+    // Without a way to stop what it may start, the program is not let run.
+    let Some(group) = Group::of(&child) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
     let out = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -246,24 +251,31 @@ fn run(mut cmd: Command, limit: u64) -> Option<Vec<u8>> {
         let _ = out.take(limit).read_to_end(&mut printed);
         let _ = tx.send(printed);
     });
+    // The output ends when the program and whatever it started close it. Until
+    // the program is reaped its id stays reserved, so the group can be stopped
+    // without any risk of hitting another one that took the same number.
     let deadline = Instant::now() + WAIT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => break None,
+    let printed = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok();
+    let status = match printed {
+        Some(_) => loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                _ => break None,
+            }
+        },
+        None => None,
+    };
+    match status {
+        // Reaped: the group is never signalled after this.
+        Some(status) => printed.filter(|_| status.success()),
+        None => {
+            group.kill();
+            let _ = child.kill();
+            let _ = child.wait();
+            None
         }
-    };
-    let printed = match status {
-        Some(s) if s.success() => rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok(),
-        _ => None,
-    };
-    if printed.is_none() {
-        group.kill();
-        let _ = child.kill();
     }
-    let _ = child.wait();
-    printed
 }
 
 /// The program run for a thumbnail with everything it starts: its own process
@@ -285,31 +297,33 @@ extern "system" {
 
 impl Group {
     #[cfg(unix)]
-    fn of(child: &std::process::Child) -> Group {
-        Group { id: child.id() as i32 }
+    fn of(child: &std::process::Child) -> Option<Group> {
+        Some(Group { id: child.id() as i32 })
     }
 
     #[cfg(windows)]
-    fn of(child: &std::process::Child) -> Group {
+    fn of(child: &std::process::Child) -> Option<Group> {
         use std::os::windows::io::AsRawHandle;
-        // SAFETY: plain Win32 calls on a live process handle; a null job is never used.
+        // SAFETY: plain Win32 calls on a live process handle; the job is closed on failure.
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if !job.is_null() && AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
-                CloseHandle(job);
-                return Group { job: std::ptr::null_mut() };
+            if job.is_null() {
+                return None;
             }
-            Group { job }
+            if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Group { job })
         }
     }
 
     #[cfg(not(any(unix, windows)))]
-    fn of(_child: &std::process::Child) -> Group {
-        Group {}
+    fn of(_child: &std::process::Child) -> Option<Group> {
+        Some(Group {})
     }
 
-    /// Called while the program is still running or has left processes behind,
-    /// so the group still exists and its id cannot belong to anything else.
+    /// Only called before the program is reaped: see `run`.
     fn kill(&self) {
         #[cfg(unix)]
         // SAFETY: kill has no memory preconditions; the group is the child's own.
@@ -317,11 +331,9 @@ impl Group {
             libc::kill(-self.id, libc::SIGKILL);
         }
         #[cfg(windows)]
-        if !self.job.is_null() {
-            // SAFETY: the job handle is owned by this value and still open.
-            unsafe {
-                TerminateJobObject(self.job, 1);
-            }
+        // SAFETY: the job handle is owned by this value and still open.
+        unsafe {
+            TerminateJobObject(self.job, 1);
         }
     }
 }
@@ -329,11 +341,9 @@ impl Group {
 #[cfg(windows)]
 impl Drop for Group {
     fn drop(&mut self) {
-        if !self.job.is_null() {
-            // SAFETY: closed once, here.
-            unsafe {
-                CloseHandle(self.job);
-            }
+        // SAFETY: the handle is valid and closed once, here.
+        unsafe {
+            CloseHandle(self.job);
         }
     }
 }

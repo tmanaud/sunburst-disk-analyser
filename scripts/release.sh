@@ -20,17 +20,23 @@ git fetch --quiet origin main --tags
 ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "$tag exists already"
 
 start="$(git rev-parse HEAD)"
+# Checksums of what the release commit holds, to make sure it is still what was tested.
+cargo_files() { shasum -a 256 Cargo.toml Cargo.lock; }
+release_files() { cargo_files; find docs/screenshots -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256; }
 current="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 echo "Version $current -> $version"
 perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' Cargo.toml
 cargo update --quiet --workspace --offline 2>/dev/null || cargo update --quiet --workspace
+bumped="$(cargo_files)"
 
 echo "Tests"
 cargo test --quiet
 cargo clippy --quiet --all-targets -- -D warnings
+[[ "$(cargo_files)" == "$bumped" ]] || die "Cargo.toml or Cargo.lock changed during the tests; nothing was committed"
 
 echo "README pictures"
 scripts/screenshots.sh
+tested="$(release_files)"
 
 echo
 git status --short
@@ -51,6 +57,8 @@ unexpected="$(git status --porcelain --untracked-files=all | cut -c4- \
     | grep -vE '^(Cargo\.toml|Cargo\.lock|docs/screenshots/.+)$' || true)"
 [[ -z "$unexpected" ]] || die "unexpected changes, nothing was committed:
 $unexpected"
+[[ "$(release_files)" == "$tested" ]] \
+    || die "Cargo.toml, Cargo.lock or a picture changed after the tests; nothing was committed"
 
 git add Cargo.toml Cargo.lock docs/screenshots
 git commit --quiet -m "release: $tag" -- Cargo.toml Cargo.lock docs/screenshots
