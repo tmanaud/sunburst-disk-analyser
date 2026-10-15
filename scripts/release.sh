@@ -36,6 +36,7 @@ cargo clippy --quiet --all-targets -- -D warnings
 
 echo "README pictures"
 scripts/screenshots.sh
+[[ "$(cargo_files)" == "$bumped" ]] || die "Cargo.toml or Cargo.lock changed while the pictures were made; nothing was committed"
 tested="$(release_files)"
 
 echo
@@ -57,7 +58,7 @@ unexpected="$(git status --porcelain --untracked-files=all | cut -c4- \
     | grep -vE '^(Cargo\.toml|Cargo\.lock|docs/screenshots/.+)$' || true)"
 [[ -z "$unexpected" ]] || die "unexpected changes, nothing was committed:
 $unexpected"
-[[ "$(release_files)" == "$tested" ]] \
+[[ "$(cargo_files)" == "$bumped" && "$(release_files)" == "$tested" ]] \
     || die "Cargo.toml, Cargo.lock or a picture changed after the tests; nothing was committed"
 
 git add Cargo.toml Cargo.lock docs/screenshots
