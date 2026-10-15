@@ -3,6 +3,7 @@
 
 use crate::app::{Action, App, Cmd};
 use crate::chart::{self, Geo, Hit, SegKind};
+use crate::filter::{self, Age, Filter, Kind};
 use crate::i18n::{t, tf, tn};
 use crate::ops::OpKind;
 use crate::platform::{self, LocKind, Location};
@@ -18,6 +19,8 @@ const SIDEBAR_W: f32 = 210.0;
 const TOPBAR_H: f32 = 56.0;
 const FOOTER_H: f32 = 74.0;
 const CRUMB_H: f32 = 30.0;
+/// Row of search filters under the toolbar.
+const FILTER_H: f32 = 40.0;
 const ROW_H: f32 = 32.0;
 const FLAT_ROW_H: f32 = 46.0;
 const COL_W: f32 = 264.0;
@@ -320,7 +323,14 @@ impl App {
         match session {
             Some(s) => {
                 let crumbs = Rect::from_min_max(pos2(rect.left() + 1.0, footer.top() - CRUMB_H), pos2(rect.right() - 1.0, footer.top()));
-                let content = Rect::from_min_max(pos2(rect.left() + 1.0, top.bottom() + 1.0), pos2(rect.right() - 1.0, crumbs.top()));
+                let mut below = top.bottom();
+                if s.search_open {
+                    let bar = Rect::from_min_size(pos2(rect.left(), below), vec2(rect.width(), FILTER_H));
+                    self.filter_bar(ui, bar, s, acts);
+                    ui.painter().line_segment([bar.left_bottom(), bar.right_bottom()], line);
+                    below = bar.bottom();
+                }
+                let content = Rect::from_min_max(pos2(rect.left() + 1.0, below + 1.0), pos2(rect.right() - 1.0, crumbs.top()));
                 self.content(ui, content, s, acts);
                 self.crumbs(ui, crumbs, s, acts);
             }
@@ -491,6 +501,111 @@ impl App {
         }
         let hint = widgets::fit_end(ui, t("Click the Start Scanning button to review its content"), &regular(14.5), rect.width() - 40.0);
         p.text(pos2(left, cy + 108.0), Align2::LEFT_CENTER, hint, regular(14.5), pal.text_dim);
+    }
+
+    // ---- search filters --------------------------------------------------------
+
+    /// Preset filters for the search: type, minimum size, modification date.
+    fn filter_bar(&self, ui: &mut Ui, rect: Rect, s: &Session, acts: &mut Vec<Action>) {
+        let pal = &self.pal;
+        let f = s.filter;
+        let cy = rect.center().y;
+        let mut x = rect.left() + 14.0;
+
+        let kinds: Vec<Kind> = Kind::ALL.into_iter().filter(|k| f.kinds & k.bit() != 0).collect();
+        let label = match kinds.as_slice() {
+            [] => t("Type").to_owned(),
+            [k] => t(k.label()).to_owned(),
+            [k, rest @ ..] => format!("{} +{}", t(k.label()), rest.len()),
+        };
+        let resp = self.chip(ui, &mut x, cy, &label, !kinds.is_empty(), "type");
+        self.filter_popup(ui, &resp, "type", egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            for k in Kind::ALL {
+                let mut on = f.kinds & k.bit() != 0;
+                if ui.checkbox(&mut on, t(k.label())).changed() {
+                    acts.push(Action::SetFilter(Filter { kinds: f.kinds ^ k.bit(), ..f }));
+                }
+            }
+        });
+
+        let label = match filter::MIN_SIZES.iter().find(|(b, _)| *b == f.min_size) {
+            Some((_, l)) => format!("≥ {l}"),
+            None => t("Size").to_owned(),
+        };
+        let resp = self.chip(ui, &mut x, cy, &label, f.min_size > 0, "size");
+        self.filter_popup(ui, &resp, "size", egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            if ui.selectable_label(f.min_size == 0, t("Any size")).clicked() {
+                acts.push(Action::SetFilter(Filter { min_size: 0, ..f }));
+            }
+            for (bytes, l) in filter::MIN_SIZES {
+                if ui.selectable_label(f.min_size == bytes, format!("≥ {l}")).clicked() {
+                    acts.push(Action::SetFilter(Filter { min_size: bytes, ..f }));
+                }
+            }
+        });
+
+        let label = if f.age == Age::Any { t("Modified") } else { t(f.age.label()) };
+        let resp = self.chip(ui, &mut x, cy, label, f.age != Age::Any, "age");
+        self.filter_popup(ui, &resp, "age", egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            if ui.selectable_label(f.age == Age::Any, t(Age::Any.label())).clicked() {
+                acts.push(Action::SetFilter(Filter { age: Age::Any, ..f }));
+            }
+            for (i, age) in Age::PRESETS.into_iter().enumerate() {
+                if i == 3 {
+                    ui.separator();
+                }
+                if ui.selectable_label(f.age == age, t(age.label())).clicked() {
+                    acts.push(Action::SetFilter(Filter { age, ..f }));
+                }
+            }
+        });
+
+        if !f.is_empty() {
+            let text = t("Clear Filters");
+            let w = widgets::text_width(ui, text, &regular(12.5)) + 16.0;
+            let r = Rect::from_min_size(pos2(x, cy - 13.0), vec2(w, 26.0));
+            let resp = ui.interact(r, ui.id().with("filter-clear"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, text, regular(12.5), if resp.hovered() { pal.text } else { pal.accent });
+            if resp.clicked() {
+                acts.push(Action::SetFilter(Filter::default()));
+            }
+            x = r.right() + 8.0;
+        }
+
+        // The results are capped: say so, since more items match.
+        if s.search_capped {
+            let text = tf("Showing the {} largest results", &[&crate::session::SEARCH_LIMIT.to_string()]);
+            let text = widgets::fit_end(ui, &text, &regular(12.5), rect.right() - x - 20.0);
+            ui.painter().text(pos2(rect.right() - 16.0, cy), Align2::RIGHT_CENTER, text, regular(12.5), pal.text_faint);
+        }
+    }
+
+    /// Rounded filter button with a chevron; `x` moves past it.
+    fn chip(&self, ui: &mut Ui, x: &mut f32, cy: f32, label: &str, active: bool, key: &str) -> egui::Response {
+        let pal = &self.pal;
+        let font = if active { semibold(12.5) } else { regular(12.5) };
+        let w = widgets::text_width(ui, label, &font) + 38.0;
+        let r = Rect::from_min_size(pos2(*x, cy - 13.0), vec2(w, 26.0));
+        let resp = ui.interact(r, ui.id().with(("filter-chip", key)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let fill = if active { pal.side_selected } else if resp.hovered() { pal.row_hover } else { pal.control.gamma_multiply(0.75) };
+        let line = if active { pal.accent.gamma_multiply(0.8) } else { pal.control_line };
+        ui.painter().rect_filled(r, CornerRadius::same(13), fill);
+        ui.painter().rect_stroke(r, CornerRadius::same(13), Stroke::new(1.0_f32, line), egui::StrokeKind::Inside);
+        ui.painter().text(pos2(r.left() + 12.0, cy), Align2::LEFT_CENTER, label, font, if active { pal.text } else { pal.text_dim });
+        icons::chevron(ui.painter(), Rect::from_center_size(pos2(r.right() - 14.0, cy), vec2(12.0, 12.0)), pal.text_dim, true);
+        *x = r.right() + 8.0;
+        resp
+    }
+
+    fn filter_popup(&self, ui: &Ui, anchor: &egui::Response, key: &str, close: egui::PopupCloseBehavior, add: impl FnOnce(&mut Ui)) {
+        let id = ui.id().with(("filter-popup", key));
+        if anchor.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        egui::popup::popup_below_widget(ui, id, anchor, close, |ui| {
+            ui.set_min_width(anchor.rect.width().max(170.0));
+            add(ui);
+        });
     }
 
     // ---- results -----------------------------------------------------------------
@@ -867,8 +982,8 @@ impl App {
         if rows.is_empty() {
             let text = if !searching {
                 if s.scan.is_done() { t("No files found") } else { t("Scanning…") }
-            } else if s.query.trim().is_empty() {
-                t("Type a name to search the scanned items")
+            } else if !s.has_search() {
+                t("Type a name or choose a filter to search the scanned items")
             } else if s.searching {
                 t("Searching…")
             } else {

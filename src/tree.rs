@@ -6,6 +6,8 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
+use crate::filter::Filter;
+
 pub type NodeId = u32;
 pub const NO_NODE: NodeId = u32::MAX;
 /// Most items one scan keeps, which bounds its memory to a few gigabytes
@@ -279,30 +281,43 @@ impl Tree {
         v.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Case-insensitive name search; returns the `limit` largest matches.
-    /// `superseded` is polled regularly so an outdated search can stop early.
-    pub fn search(&self, query: &str, limit: usize, superseded: &dyn Fn() -> bool) -> Vec<NodeId> {
+    /// Case-insensitive name search narrowed by `filter`; returns the `limit`
+    /// largest matches. An empty query matches every name. `superseded` is
+    /// polled regularly so an outdated search can stop early.
+    pub fn search(&self, query: &str, filter: &Filter, now: i64, limit: usize, superseded: &dyn Fn() -> bool) -> Vec<NodeId> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
         let q = query.to_lowercase();
-        if q.is_empty() {
+        if q.is_empty() && filter.is_empty() {
             return Vec::new();
         }
-        let mut hits: Vec<NodeId> = Vec::new();
+        let mut heap: BinaryHeap<Reverse<(u64, NodeId)>> = BinaryHeap::with_capacity(limit + 1);
         for (i, n) in self.nodes.iter().enumerate().skip(1) {
             if i % 8192 == 0 && superseded() {
                 return Vec::new();
             }
-            if n.flags & F_DELETED != 0 {
+            if n.flags & F_DELETED != 0 || !filter.matches(n, now) {
                 continue;
             }
-            if n.name.to_string_lossy().to_lowercase().contains(&q) {
-                hits.push(i as NodeId);
+            let full = heap.len() >= limit;
+            if full && heap.peek().is_some_and(|Reverse((min, _))| n.size <= *min) {
+                continue;
             }
+            if !q.is_empty() && !n.name.to_string_lossy().to_lowercase().contains(&q) {
+                continue;
+            }
+            // A match inside a deleted folder is gone too.
+            if self.has_deleted_ancestor(i as NodeId) {
+                continue;
+            }
+            if full {
+                heap.pop();
+            }
+            heap.push(Reverse((n.size, i as NodeId)));
         }
-        // A match inside a deleted folder is gone too.
-        hits.retain(|&id| !self.has_deleted_ancestor(id));
-        hits.sort_by(|&a, &b| self.nodes[b as usize].size.cmp(&self.nodes[a as usize].size));
-        hits.truncate(limit);
-        hits
+        let mut v: Vec<(u64, NodeId)> = heap.into_iter().map(|r| r.0).collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        v.into_iter().map(|(_, id)| id).collect()
     }
 
     /// True when the node or one of its ancestors was removed.
@@ -374,9 +389,25 @@ mod tests {
         let t = sample();
         let b = t.biggest_files(2);
         assert_eq!(b, vec![4, 2]);
-        let s = t.search("B", 10, &|| false);
+        let s = t.search("B", &Filter::default(), 0, 10, &|| false);
         assert_eq!(s, vec![4, 2]);
         assert!(t.in_hidden(3));
         assert!(!t.in_hidden(4));
+    }
+
+    #[test]
+    fn filtered_search() {
+        use crate::filter::{Age, Kind};
+        let t = sample();
+        let search = |q: &str, f: Filter| t.search(q, &f, 1_000_000_000, 10, &|| false);
+        // Without a name, the filter alone selects; a size floor keeps folders.
+        assert_eq!(search("", Filter { min_size: 50, ..Default::default() }), vec![1, 4]);
+        assert_eq!(search("", Filter { kinds: Kind::Document.bit(), ..Default::default() }), vec![2]);
+        assert_eq!(search("big", Filter { kinds: Kind::Document.bit(), ..Default::default() }), Vec::<NodeId>::new());
+        // An unknown date matches no date bound.
+        assert!(search("", Filter { age: Age::OlderThan(365), ..Default::default() }).is_empty());
+        assert!(search("", Filter::default()).is_empty());
+        // The limit keeps the largest.
+        assert_eq!(t.search("", &Filter { min_size: 1, ..Default::default() }, 0, 2, &|| false), vec![1, 4]);
     }
 }

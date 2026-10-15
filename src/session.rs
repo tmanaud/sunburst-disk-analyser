@@ -2,6 +2,7 @@
 //! lock-free view of the tree that the UI paints every frame.
 
 use crate::chart::{self, Layout, SegKind};
+use crate::filter::{self, Filter};
 use crate::ops::{self, OpItem, OpResult};
 use crate::platform::Space;
 use crate::scan::ScanHandle;
@@ -16,6 +17,8 @@ use std::time::{Duration, Instant};
 const MAX_ROWS: usize = 20_000;
 /// Most steps kept for back and forward.
 const MAX_HISTORY: usize = 200;
+/// Most search results kept, the largest ones.
+pub const SEARCH_LIMIT: usize = 300;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -111,8 +114,11 @@ pub struct Session {
     pub biggest_limit: usize,
     pub search_open: bool,
     pub query: String,
+    pub filter: Filter,
     pub search_rows: Vec<Row>,
     pub searching: bool,
+    /// The results stop at `SEARCH_LIMIT`: more items match.
+    pub search_capped: bool,
     search_seq: Arc<AtomicU64>,
     search_rx: Option<mpsc::Receiver<(u64, Vec<NodeId>)>>,
     search_hits: Vec<NodeId>,
@@ -175,8 +181,10 @@ impl Session {
             biggest_limit: 50,
             search_open: false,
             query: String::new(),
+            filter: Filter::default(),
             search_rows: Vec::new(),
             searching: false,
+            search_capped: false,
             search_seq: Arc::new(AtomicU64::new(0)),
             search_rx: None,
             search_hits: Vec::new(),
@@ -469,14 +477,29 @@ impl Session {
         self.run_search();
     }
 
+    pub fn set_filter(&mut self, filter: Filter) {
+        if filter == self.filter {
+            return;
+        }
+        self.filter = filter;
+        self.run_search();
+    }
+
+    /// Something to search for: a name or a filter.
+    pub fn has_search(&self) -> bool {
+        !self.query.trim().is_empty() || !self.filter.is_empty()
+    }
+
     /// Starts the search for the current query, superseding any running one.
     fn run_search(&mut self) {
         let query = self.query.clone();
+        let filter = self.filter;
         let seq = self.search_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        if query.trim().is_empty() {
+        if !self.has_search() {
             self.search_hits.clear();
             self.search_rows.clear();
             self.searching = false;
+            self.search_capped = false;
             self.search_rx = None;
             return;
         }
@@ -486,7 +509,7 @@ impl Session {
         self.search_rx = Some(rx);
         self.searching = true;
         std::thread::spawn(move || {
-            let hits = tree.read().search(query.trim(), 300, &|| latest.load(Ordering::Acquire) != seq);
+            let hits = tree.read().search(query.trim(), &filter, filter::now(), SEARCH_LIMIT + 1, &|| latest.load(Ordering::Acquire) != seq);
             let _ = tx.send((seq, hits));
         });
     }
@@ -499,7 +522,9 @@ impl Session {
         if let Some(rx) = &self.search_rx {
             if let Ok((seq, hits)) = rx.try_recv() {
                 if seq == self.search_seq.load(Ordering::Acquire) {
+                    self.search_capped = hits.len() > SEARCH_LIMIT;
                     self.search_hits = hits;
+                    self.search_hits.truncate(SEARCH_LIMIT);
                     self.searching = false;
                     self.search_rx = None;
                     self.dirty = true;
@@ -508,7 +533,7 @@ impl Session {
         }
         let done = self.scan.is_done();
         let just_finished = done && !self.was_done;
-        if just_finished && !self.query.trim().is_empty() {
+        if just_finished && self.has_search() {
             // Results found while scanning miss whatever was discovered later.
             self.run_search();
         }

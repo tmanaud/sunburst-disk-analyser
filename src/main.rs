@@ -5,6 +5,7 @@ mod chart;
 mod demo;
 mod dialogs;
 mod export;
+mod filter;
 mod i18n;
 mod icon;
 mod icons;

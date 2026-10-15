@@ -78,6 +78,7 @@ pub enum Action {
     Crumb(NodeId),
     MoreBiggest,
     SetQuery(String),
+    SetFilter(crate::filter::Filter),
     CloseSearch,
     /// A command applied to a specific item (context menus).
     On(Cmd, NodeId),
@@ -529,6 +530,7 @@ impl App {
                     s.search_open = !s.search_open;
                     if !s.search_open {
                         s.set_query(String::new());
+                        s.set_filter(Default::default());
                     }
                     s.mark_dirty();
                     self.focus_search = true;
@@ -659,9 +661,11 @@ impl App {
                         s.mark_dirty();
                     }
                     Action::SetQuery(q) => s.set_query(q),
+                    Action::SetFilter(f) => s.set_filter(f),
                     Action::CloseSearch => {
                         s.search_open = false;
                         s.set_query(String::new());
+                        s.set_filter(Default::default());
                         s.mark_dirty();
                     }
                     _ => {}
@@ -863,6 +867,14 @@ impl App {
                 "biggest" => {
                     if let Some(s) = self.session_mut() {
                         s.tab = Tab::Biggest;
+                        s.mark_dirty();
+                    }
+                }
+                "search" => {
+                    if let Some(s) = self.session_mut() {
+                        use crate::filter::{Age, Filter, Kind};
+                        s.search_open = true;
+                        s.set_filter(Filter { kinds: Kind::Video.bit() | Kind::Image.bit(), min_size: 10_000_000, age: Age::OlderThan(365) });
                         s.mark_dirty();
                     }
                 }
