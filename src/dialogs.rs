@@ -5,7 +5,8 @@ use crate::i18n::{self, t, tf, tn};
 use crate::ops::OpKind;
 use crate::settings::{Appearance, Settings};
 use crate::theme::{regular, semibold};
-use crate::{icons, platform, util, widgets};
+use crate::update::Stage;
+use crate::{icons, platform, update, util, widgets};
 use egui::{vec2, Color32, RichText, Sense, Ui};
 use std::sync::atomic::Ordering;
 
@@ -14,6 +15,9 @@ enum Outcome {
     Close,
     Confirm,
     Reveal(std::path::PathBuf),
+    Download,
+    SkipVersion(String),
+    OpenPage(String),
 }
 
 fn title(ui: &mut Ui, text: &str) {
@@ -275,6 +279,8 @@ impl App {
                     settings_changed |= ui.checkbox(&mut s.show_selection_hint, t("Show hint for selected items")).changed();
                     settings_changed |= ui.checkbox(&mut s.allow_removing_hidden, t("Allow removing hidden files and folders")).changed();
                     ui.label(RichText::new(t("Removing hidden items is not recommended.")).color(pal.text_dim).font(regular(12.0)));
+                    settings_changed |= ui.checkbox(&mut s.check_updates, t("Check for updates at launch")).changed();
+                    ui.label(RichText::new(t("Asks GitHub for the latest version. Nothing about your disks or files is sent.")).color(pal.text_dim).font(regular(12.0)));
                     ui.add_space(8.0);
                     ui.separator();
                     ui.label(RichText::new(t("Disk Access")).font(semibold(13.5)));
@@ -340,6 +346,97 @@ impl App {
                         }
                     });
                 }
+                Dialog::Update(stage) => {
+                    ui.set_width(460.0);
+                    let dim = |text: &str| RichText::new(text.to_owned()).color(pal.text_dim);
+                    match stage {
+                        Stage::Checking => {
+                            title(ui, t("Checking for updates…"));
+                            ui.add(egui::Spinner::new());
+                            buttons(ui, |ui| {
+                                if secondary(ui, t("Cancel")) {
+                                    outcome = Outcome::Close;
+                                }
+                            });
+                        }
+                        Stage::UpToDate => {
+                            title(ui, t("You are up to date"));
+                            ui.label(dim(&tf("Version {} is the latest version.", &[env!("CARGO_PKG_VERSION")])));
+                            buttons(ui, |ui| {
+                                if primary(ui, t("OK"), pal.accent) {
+                                    outcome = Outcome::Close;
+                                }
+                            });
+                        }
+                        Stage::Available(release) => {
+                            title(ui, t("A new version is available"));
+                            ui.label(tf("Version {} is available. You have version {}.", &[&release.version, env!("CARGO_PKG_VERSION")]));
+                            if !release.notes.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(t("What’s New")).font(semibold(13.5)));
+                                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                    ui.add(egui::Label::new(dim(&release.notes).font(regular(12.5))).wrap());
+                                });
+                            }
+                            if release.asset.is_none() {
+                                ui.label(dim(t("No download for this system is attached to this release.")).font(regular(12.0)));
+                            }
+                            if ui.add(egui::Link::new(RichText::new(t("Open Release Page")).color(pal.accent))).clicked() {
+                                outcome = Outcome::OpenPage(release.page.clone());
+                            }
+                            buttons(ui, |ui| {
+                                if release.asset.is_some() && primary(ui, t("Download"), pal.accent) {
+                                    outcome = Outcome::Download;
+                                }
+                                if secondary(ui, t("Later")) {
+                                    outcome = Outcome::Close;
+                                }
+                                if secondary(ui, t("Skip This Version")) {
+                                    outcome = Outcome::SkipVersion(release.version.clone());
+                                }
+                            });
+                        }
+                        Stage::Downloading(release, job) => {
+                            title(ui, &tf("Downloading version {}…", &[&release.version]));
+                            let done = job.done.load(Ordering::Relaxed);
+                            let fraction = if job.total > 0 { done as f32 / job.total as f32 } else { 0.0 };
+                            ui.add(egui::ProgressBar::new(fraction.min(1.0)).desired_width(ui.available_width()));
+                            ui.label(dim(&tf("{} of {}", &[&util::fmt_size(done), &util::fmt_size(job.total)])));
+                            buttons(ui, |ui| {
+                                if secondary(ui, t("Cancel")) {
+                                    outcome = Outcome::Close;
+                                }
+                            });
+                        }
+                        Stage::Downloaded(file) => {
+                            title(ui, t("Update downloaded"));
+                            let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            let folder = file.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                            ui.add(egui::Label::new(tf("{} was saved in {} and its checksum was verified.", &[&name, &folder])).wrap());
+                            ui.add(egui::Label::new(dim(update::install_steps(file))).wrap());
+                            buttons(ui, |ui| {
+                                if primary(ui, t("Close"), pal.accent) {
+                                    outcome = Outcome::Close;
+                                }
+                                if secondary(ui, crate::views::reveal_label()) {
+                                    outcome = Outcome::Reveal(file.clone());
+                                }
+                            });
+                        }
+                        Stage::Failed(heading, body) => {
+                            title(ui, heading);
+                            ui.add(egui::Label::new(dim(body)).wrap());
+                            buttons(ui, |ui| {
+                                if primary(ui, t("Close"), pal.accent) {
+                                    outcome = Outcome::Close;
+                                }
+                                if secondary(ui, t("Open Release Page")) {
+                                    outcome = Outcome::OpenPage(update::releases_page());
+                                }
+                            });
+                        }
+                    }
+                }
                 Dialog::Message { title: heading, body } => {
                     ui.set_width(420.0);
                     title(ui, heading);
@@ -362,7 +459,27 @@ impl App {
         }
         match outcome {
             Outcome::Keep => {}
-            Outcome::Close => self.dialog = Dialog::None,
+            Outcome::Close => {
+                if let Dialog::Update(Stage::Downloading(_, job)) = &self.dialog {
+                    job.cancel();
+                }
+                self.dialog = Dialog::None;
+            }
+            Outcome::Download => {
+                if let Dialog::Update(Stage::Available(release)) = &self.dialog {
+                    if let Some(job) = update::download(release, ctx.clone()) {
+                        self.dialog = Dialog::Update(Stage::Downloading(release.clone(), job));
+                    }
+                }
+            }
+            Outcome::SkipVersion(version) => {
+                self.settings.skipped_version = version;
+                self.settings.save();
+                self.dialog = Dialog::None;
+            }
+            Outcome::OpenPage(url) => {
+                let _ = open::that_detached(url);
+            }
             Outcome::Confirm => self.confirm_review(),
             Outcome::Reveal(path) => {
                 if !demo {

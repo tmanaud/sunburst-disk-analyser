@@ -105,6 +105,18 @@ noted further down.
 - **Unix systems other than macOS and Linux** compile the Unix path but
   always use the reserved-name rename and cannot report directory read
   errors. Untested and not a release target.
+- **Update downloads are checked, not authenticated.** The SHA-256 comes
+  from `SHA256SUMS.txt` in the same release, so it catches a damaged
+  download but not a release replaced by someone with write access to the
+  repository. The app only downloads from this repository's release URLs,
+  over HTTPS, and never installs anything itself. Signing the assets (for
+  example with minisign, public key built into the app) would be needed
+  before any in-place self-update.
+- **The update dialog was only checked against the published v1.0.0**
+  (`cargo test -- --ignored published_release_downloads`, macOS): the
+  "newer version" path is exercised with a lowered version number, and the
+  dialog through `--screenshot update`. It will meet a real newer release
+  for the first time after the next tag.
 - **Locally built binaries embed the build machine's home path** in panic
   messages. Publish CI builds only, or add `--remap-path-prefix`.
 

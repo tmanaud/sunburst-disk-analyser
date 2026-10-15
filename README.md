@@ -2,7 +2,7 @@
 
 See what is filling up your disks. Sunburst Disk Analyser scans a disk or a folder, shows it as an interactive sunburst chart next to a size-sorted outline, and lets you move what you no longer need to the Trash, or move or copy it elsewhere.
 
-One native binary per platform, for **macOS**, **Windows** and **Linux**. No installer, no account, no telemetry.
+One native binary per platform, for **macOS**, **Windows** and **Linux**. No installer, no account, no telemetry. The only network request is an update check at launch, which can be turned off.
 
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="docs/screenshots/demo-still.png">
@@ -42,6 +42,12 @@ Get the file for your system from the [latest release](https://github.com/tmanau
 | Linux x86_64 | `…-linux-x86_64.AppImage` or `.tar.gz` | `chmod +x` the AppImage and run it. Needs glibc 2.35+ and OpenGL. The folder picker uses the desktop portal (`xdg-desktop-portal`). The `.tar.gz` holds the bare binary and also needs `libxkbcommon` and, on X11, `libxkbcommon-x11`. |
 
 `SHA256SUMS.txt` in each release lists the checksums.
+
+### Updates
+
+At launch the app asks GitHub for the latest release (one request to `api.github.com`; GitHub sees your IP address and the app version, nothing about your disks or files is sent). When a newer version exists, a dialog offers to download it, open the release page, or skip that version. **Check for Updates…** is in the app menu on macOS and in the Help menu elsewhere; the check at launch can be turned off in Settings.
+
+The download goes to your Downloads folder and is checked against the release's `SHA256SUMS.txt`. The app never replaces itself: quit it and swap in the new version. On macOS the app is not signed with a Developer ID, so the new copy may have to be granted Full Disk Access again.
 
 ### Disk access on macOS
 

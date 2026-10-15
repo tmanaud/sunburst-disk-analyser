@@ -34,6 +34,7 @@ const COMMANDS: &[(&str, Cmd)] = &[
     ("deselect", Cmd::DeselectAll),
     ("settings", Cmd::Settings),
     ("about", Cmd::About),
+    ("check-updates", Cmd::CheckUpdates),
     ("help", Cmd::Help),
 ];
 
@@ -71,6 +72,7 @@ impl NativeMenu {
         let app = Submenu::new(app_name, true);
         let _ = app.append_items(&[
             &item("about", t("About Sunburst Disk Analyser"), None),
+            &item("check-updates", t("Check for Updates…"), None),
             &sep(),
             &item("settings", t("Settings…"), key(Code::Comma)),
             &sep(),

@@ -23,6 +23,7 @@ mod swipe;
 mod theme;
 mod thumb;
 mod tree;
+mod update;
 mod util;
 mod views;
 mod widgets;

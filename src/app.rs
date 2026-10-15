@@ -9,7 +9,7 @@ use crate::swipe::Swipe;
 use crate::settings::{Appearance, Settings};
 use crate::theme::{self, Palette};
 use crate::tree::NodeId;
-use crate::{demo, export, util};
+use crate::{demo, export, update, util};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -61,6 +61,7 @@ pub enum Cmd {
     Settings,
     About,
     Help,
+    CheckUpdates,
     Quit,
 }
 
@@ -131,6 +132,7 @@ pub enum Dialog {
     Settings,
     About,
     Help,
+    Update(update::Stage),
     Message { title: String, body: String },
 }
 
@@ -165,6 +167,10 @@ pub struct App {
     volumes_checked: Instant,
     /// Whether protected folders can be read without a system prompt, see `platform::has_full_disk_access`.
     pub disk_access: bool,
+    /// Update check under way; `true` when asked for from the menu.
+    update_check: Option<(update::Check, bool)>,
+    /// Newer release found at launch, shown once no other dialog is open.
+    pending_update: Option<update::Release>,
     frame: u64,
     shot_requested: bool,
     recorder: Option<crate::record::Recorder>,
@@ -213,6 +219,8 @@ impl App {
             applied_lang: None,
             volumes_checked: Instant::now(),
             disk_access: opts.demo || platform::has_full_disk_access(),
+            update_check: None,
+            pending_update: None,
             frame: 0,
             shot_requested: false,
             recorder: None,
@@ -227,6 +235,9 @@ impl App {
         } else if opts.demo {
             app.load_demo();
         } else {
+            if app.settings.check_updates {
+                app.update_check = Some((update::check(cc.egui_ctx.clone()), false));
+            }
             app.home = platform::home();
             app.volumes = platform::volumes();
             app.folders = platform::standard_folders();
@@ -603,7 +614,52 @@ impl App {
             }
             Cmd::About => self.dialog = Dialog::About,
             Cmd::Help => self.dialog = Dialog::Help,
+            Cmd::CheckUpdates => {
+                if self.opts.demo {
+                    self.dialog = Dialog::Update(update::Stage::UpToDate);
+                } else {
+                    self.dialog = Dialog::Update(update::Stage::Checking);
+                    self.update_check = Some((update::check(ctx.clone()), true));
+                }
+            }
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    // ---- updates ------------------------------------------------------------
+
+    fn poll_update(&mut self) {
+        use update::{Outcome, Stage};
+        if let Some(outcome) = self.update_check.as_ref().and_then(|(check, _)| check.take()) {
+            let manual = self.update_check.take().is_some_and(|(_, manual)| manual);
+            if manual {
+                // The answer is dropped when its dialog was closed meanwhile.
+                if matches!(self.dialog, Dialog::Update(Stage::Checking)) {
+                    self.dialog = Dialog::Update(match outcome {
+                        Outcome::UpToDate => Stage::UpToDate,
+                        Outcome::Available(release) => Stage::Available(release),
+                        Outcome::Failed(e) => Stage::Failed(t("Could not check for updates"), e),
+                    });
+                }
+            } else if let Outcome::Available(release) = outcome {
+                // A failed check at launch stays silent.
+                if release.version != self.settings.skipped_version {
+                    self.pending_update = Some(release);
+                }
+            }
+        }
+        if matches!(self.dialog, Dialog::None) {
+            if let Some(release) = self.pending_update.take() {
+                self.dialog = Dialog::Update(Stage::Available(release));
+            }
+        }
+        if let Dialog::Update(Stage::Downloading(_, job)) = &self.dialog {
+            if let Some(result) = job.take() {
+                self.dialog = Dialog::Update(match result {
+                    Ok(file) => Stage::Downloaded(file),
+                    Err(e) => Stage::Failed(t("Could not download the update"), e),
+                });
+            }
         }
     }
 
@@ -910,6 +966,7 @@ impl App {
                     self.hover_lock = true;
                 }
                 "settings" => self.dialog = Dialog::Settings,
+                "update" => self.dialog = Dialog::Update(update::Stage::Available(update::sample_release())),
                 _ => {
                     if let Some(s) = self.session_mut() {
                         s.hover = Some(3);
@@ -974,13 +1031,14 @@ impl eframe::App for App {
         self.handle_swipe(ctx);
         self.handle_drops(ctx);
         self.poll_operation();
+        self.poll_update();
 
         if !self.opts.demo && self.volumes_checked.elapsed() > Duration::from_secs(20) {
             self.volumes = platform::volumes();
             self.volumes_checked = Instant::now();
         }
 
-        let mut busy = matches!(self.dialog, Dialog::Progress { .. });
+        let mut busy = matches!(self.dialog, Dialog::Progress { .. } | Dialog::Update(update::Stage::Downloading(..)));
         if let Some(s) = self.session_mut() {
             busy |= s.refresh();
         }

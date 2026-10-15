@@ -27,6 +27,10 @@ pub struct Settings {
     /// Width of an outline column, and of the flat lists, next to the chart.
     pub column_width: f32,
     pub list_width: f32,
+    /// Ask GitHub for a newer release when the app opens.
+    pub check_updates: bool,
+    /// Release the user chose not to be told about again.
+    pub skipped_version: String,
     /// Set for demo and screenshot runs, which must not touch the saved preferences.
     #[serde(skip)]
     pub ephemeral: bool,
@@ -45,6 +49,8 @@ impl Default for Settings {
             scan_home_at_launch: true,
             column_width: 264.0,
             list_width: 320.0,
+            check_updates: true,
+            skipped_version: String::new(),
             ephemeral: false,
         }
     }

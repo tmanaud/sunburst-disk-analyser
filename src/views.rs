@@ -145,6 +145,7 @@ impl App {
                 });
                 ui.menu_button(t("Help"), |ui| {
                     entry(ui, t("Sunburst Disk Analyser Help"), "", Cmd::Help);
+                    entry(ui, t("Check for Updates…"), "", Cmd::CheckUpdates);
                     entry(ui, t("About Sunburst Disk Analyser"), "", Cmd::About);
                 });
             });
