@@ -760,10 +760,11 @@ impl App {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
-        if matches!(self.dialog, Dialog::None) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-            if self.session().map(|s| s.search_open).unwrap_or(false) {
-                self.actions.push(Action::CloseSearch);
-            }
+        if matches!(self.dialog, Dialog::None)
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+            && self.session().map(|s| s.search_open).unwrap_or(false)
+        {
+            self.actions.push(Action::CloseSearch);
         }
         if ctx.wants_keyboard_input() {
             return;
@@ -1012,6 +1013,10 @@ impl eframe::App for App {
 
         let mut actions = std::mem::take(&mut self.actions);
         self.draw(ctx, &mut actions);
+        // Access is granted in System Settings, with the dialog left open behind.
+        if matches!(self.dialog, Dialog::Settings) && !self.opts.demo && ctx.input(|i| i.events.contains(&egui::Event::WindowFocused(true))) {
+            self.disk_access = platform::has_full_disk_access();
+        }
         self.draw_dialog(ctx);
         actions.append(&mut self.actions);
 

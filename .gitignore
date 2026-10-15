@@ -4,3 +4,7 @@
 nimbalyst-local/
 # Local review notes (contain machine-specific paths)
 docs/adversarial-review-*.md
+
+# Nimbalyst working files and the local competitor study (third-party screenshots)
+.nimbalyst/
+docs/research/

@@ -446,7 +446,7 @@ impl Session {
                 OpItem { id, ident, path, size: n.size, is_dir: n.is_dir() }
             })
             .collect();
-        items.sort_by(|a, b| b.size.cmp(&a.size));
+        items.sort_by_key(|item| std::cmp::Reverse(item.size));
         items
     }
 

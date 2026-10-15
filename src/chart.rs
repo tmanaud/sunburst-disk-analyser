@@ -296,7 +296,7 @@ pub fn paint_idle_art(p: &egui::Painter, center: Pos2, radius: f32, pal: &Palett
         let len = 0.25 + (seed >> 8 & 0xff) as f32 / 255.0 * 0.95;
         let faint = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), if pal.dark { 20 } else { 34 });
         let ray = Geo { center, r0: g.r0 + g.ring + 3.0, ring: radius * 0.3 * len };
-        let wide = (seed >> 20) % 3 == 0;
+        let wide = (seed >> 20).is_multiple_of(3);
         let (b0, b1) = if wide { (a0 - 0.05, a1 + 0.05) } else { (a0, a1) };
         add_segment(&mut rays, &ray, &Seg { id: 0, kind: SegKind::Node, depth: 1, a0: b0, a1: b1, size: 0, hidden: false }, faint);
     }

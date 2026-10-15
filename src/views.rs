@@ -1146,10 +1146,8 @@ impl App {
                             acts.push(Action::SelectPath(seg.id));
                         }
                     }
-                    SegKind::Small => {
-                        if resp.clicked() && !resp.double_clicked() && seg.id != s.view_root {
-                            acts.push(Action::SelectPath(seg.id));
-                        }
+                    SegKind::Small if resp.clicked() && !resp.double_clicked() && seg.id != s.view_root => {
+                        acts.push(Action::SelectPath(seg.id));
                     }
                     _ => {}
                 }

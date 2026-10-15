@@ -53,7 +53,7 @@ pub fn fit_middle(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String 
     let total = text.chars().count();
     let (mut lo, mut hi) = (5usize, total.saturating_sub(1).max(5));
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         if text_width(ui, &util::middle_ellipsis(text, mid), font) <= max_width {
             lo = mid;
         } else {
@@ -71,7 +71,7 @@ pub fn fit_end(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> String {
     let chars: Vec<char> = text.chars().collect();
     let (mut lo, mut hi) = (1usize, chars.len());
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         let s: String = chars[..mid].iter().chain(std::iter::once(&'…')).collect();
         if text_width(ui, &s, font) <= max_width {
             lo = mid;
