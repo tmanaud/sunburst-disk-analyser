@@ -611,4 +611,19 @@ mod tests {
         wait(&h);
         assert_eq!(h.tree.read().denied_dirs, 1);
     }
+
+    /// Times a real scan: `SCAN_BENCH=/some/folder cargo test --release -- --ignored scan_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn scan_bench() {
+        let root = PathBuf::from(std::env::var("SCAN_BENCH").expect("SCAN_BENCH=<folder>"));
+        for run in 1..=3 {
+            let h = start_scan(root.clone());
+            while !h.is_done() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let t = h.tree.read();
+            println!("run {run}: {} files, {:.1} GB, {:.2} s", t.node(0).items, t.node(0).size as f64 / 1e9, h.elapsed().as_secs_f64());
+        }
+    }
 }

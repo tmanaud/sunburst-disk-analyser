@@ -21,11 +21,12 @@ The animation and the screenshots show built-in sample data (`--demo`), not a re
 
 ## Features
 
-- **Fast parallel scan** with live results while it runs; stop it at any time. A 74 GB folder with about 590,000 files took 2.5 s on an Apple Silicon laptop SSD.
+- **Fast parallel scan** with live results and an estimated progress bar while it runs; stop it at any time. A 74 GB folder with about 590,000 files takes about 2 s on an Apple Silicon laptop SSD (2.5 s the first time).
+- **Scan at launch**: the app can scan your home folder as soon as it opens (on by default, in Settings). On macOS it does so only once Full Disk Access is granted, so opening the app never sets off a series of permission prompts.
 - **Sunburst chart**: one ring per folder level, centred on the folder that holds the selection; hover a segment for its size, file count and date, click it to select it, click the centre to go back up.
-- **Folders Outline**: size-sorted columns, as in a column file browser; click a folder to open it in the next column, click a file for a preview pane with a thumbnail (pictures everywhere, videos and PDFs on macOS) and double-click it to open it. Scroll sideways to see the earlier columns; at their edge a two-finger swipe goes back or forward, as do the side buttons of a mouse and ⌘[ / ⌘] (Ctrl on Windows and Linux). The arrow keys walk the columns. Tiny and hidden items are grouped so the big ones stand out.
+- **Folders Outline**: size-sorted columns, as in a column file browser; click a folder to open it in the next column, click a file for a preview pane with a thumbnail and double-click it to open it. Thumbnails cover pictures everywhere, PDFs on macOS, common videos (MOV, MP4) on macOS, and any video on every system once [ffmpeg](https://ffmpeg.org) is installed (it is not bundled). Scroll sideways to see the earlier columns; at their edge a two-finger swipe goes back or forward, as do the side buttons of a mouse and ⌘[ / ⌘] (Ctrl on Windows and Linux). The arrow keys walk the columns. Tiny and hidden items are grouped so the big ones stand out. Drag the edge of a column to resize it.
 - **Biggest Files**: the largest files of the whole scan in one list.
-- **Search by name** in the scanned items.
+- **Search** the scanned items by name, and filter them by type (videos, pictures, audio, documents, archives), minimum size and modification date.
 - **Select, review, then act**: tick items, check the list, then move them to the Trash, or move or copy them to another folder. Nothing is deleted permanently and nothing is overwritten.
 - **Whole disks**: free space and space the scan could not attribute are shown next to your files.
 - Favourite folders, drag and drop of folders onto the window, CSV report export, show in Finder / Explorer / file manager, Quick Look (macOS), copy path.
