@@ -19,6 +19,7 @@ git fetch --quiet origin main --tags
 [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main is not the same as origin/main"
 ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "$tag exists already"
 
+start="$(git rev-parse HEAD)"
 current="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 echo "Version $current -> $version"
 perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' Cargo.toml
@@ -42,8 +43,17 @@ if [[ "$answer" != [yY] ]]; then
     exit 1
 fi
 
+# Nothing else may have changed meanwhile, for example from another editor.
+[[ "$(git rev-parse --abbrev-ref HEAD)" == main && "$(git rev-parse HEAD)" == "$start" ]] \
+    || die "main moved while the release was prepared; nothing was committed"
+[[ -z "$(git diff --cached --name-only)" ]] || die "files were staged meanwhile; nothing was committed"
+unexpected="$(git status --porcelain --untracked-files=all | cut -c4- \
+    | grep -vE '^(Cargo\.toml|Cargo\.lock|docs/screenshots/.+)$' || true)"
+[[ -z "$unexpected" ]] || die "unexpected changes, nothing was committed:
+$unexpected"
+
 git add Cargo.toml Cargo.lock docs/screenshots
-git commit --quiet -m "release: $tag"
+git commit --quiet -m "release: $tag" -- Cargo.toml Cargo.lock docs/screenshots
 git tag -a "$tag" -m "$tag"
 git push --atomic origin main "$tag"
 echo "Pushed $tag: the release workflow builds and publishes it."

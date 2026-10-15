@@ -13,6 +13,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 pub const FPS: f64 = 30.0;
+/// Pixels per point of the README pictures: they are drawn for Retina screens.
+const SCALE: f32 = 2.0;
 /// Frames drawn before the recording starts, while the first layouts settle.
 const WARM_UP: u64 = 8;
 
@@ -132,6 +134,7 @@ pub struct Recorder {
     saved: u64,
     writer: Option<Writer>,
     out: PathBuf,
+    finished: bool,
 }
 
 impl Recorder {
@@ -155,6 +158,7 @@ impl Recorder {
             saved: 0,
             writer: None,
             out,
+            finished: false,
         }
     }
 
@@ -255,6 +259,9 @@ impl Recorder {
 
     /// Draws the pointer over the frame and saves the frames received.
     pub fn after_frame(&mut self, ctx: &egui::Context) {
+        if self.finished {
+            return;
+        }
         ctx.request_repaint();
         self.paint_pointer(ctx);
         if self.recording() {
@@ -292,6 +299,7 @@ impl Recorder {
                 Tag::Plain => self.base = None,
             }
             let ppp = w as f32 / ctx.screen_rect().width();
+            check_scale(ppp);
             let writer = self.writer.get_or_insert_with(|| Writer::new(self.out.clone(), ppp));
             self.saved += 1;
             writer.save(self.saved, img.clone());
@@ -299,10 +307,14 @@ impl Recorder {
         }
 
         if !self.recording() && self.frame > WARM_UP && self.tags.is_empty() {
-            if let Some(writer) = self.writer.take() {
-                writer.finish();
-                println!("{} frames written to {}", self.saved, self.out.display());
+            let failed = self.writer.take().map(Writer::finish).unwrap_or(0);
+            if failed > 0 || self.saved == 0 {
+                // A missing frame would make a shorter animation without a word.
+                eprintln!("recording failed: {failed} of {} frames could not be written", self.saved);
+                std::process::exit(1);
             }
+            println!("{} frames written to {}", self.saved, self.out.display());
+            self.finished = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -355,12 +367,25 @@ fn mix(img: &mut RgbaImage, base: &RgbaImage, a: f32) {
     }
 }
 
+/// Stops a rendering made on a screen that is not 2x: the pictures would be
+/// blurred and laid out differently from one run to the next.
+pub fn check_scale(ppp: f32) {
+    if (ppp - SCALE).abs() > 0.01 {
+        eprintln!(
+            "The README pictures need a Retina (2x) screen, but the window opened on a {ppp}x one. \
+             Put the pointer on a Retina screen, or make it the main display, and run again."
+        );
+        std::process::exit(1);
+    }
+}
+
 // ---- saving -------------------------------------------------------------------
 
 /// Frames the pictures and writes them as PNG on a few threads.
 struct Writer {
     tx: Option<mpsc::SyncSender<(u64, RgbaImage)>>,
-    threads: Vec<JoinHandle<()>>,
+    /// Each thread returns how many frames it could not write.
+    threads: Vec<JoinHandle<u64>>,
 }
 
 impl Writer {
@@ -370,12 +395,16 @@ impl Writer {
         let threads = (0..4)
             .map(|_| {
                 let (rx, dir) = (rx.clone(), dir.clone());
-                std::thread::spawn(move || loop {
-                    let job = rx.lock().map(|r| r.recv());
-                    let Ok(Ok((n, img))) = job else { break };
-                    let out = dir.join(format!("frame-{n:04}.png"));
-                    if let Err(e) = save_png(&window_frame(&img, ppp), &out, true) {
-                        eprintln!("could not write {}: {e}", out.display());
+                std::thread::spawn(move || {
+                    let mut failed = 0;
+                    loop {
+                        let job = rx.lock().map(|r| r.recv());
+                        let Ok(Ok((n, img))) = job else { break failed };
+                        let out = dir.join(format!("frame-{n:04}.png"));
+                        if let Err(e) = save_png(&window_frame(&img, ppp), &out, true) {
+                            eprintln!("could not write {}: {e}", out.display());
+                            failed += 1;
+                        }
                     }
                 })
             })
@@ -389,22 +418,25 @@ impl Writer {
         }
     }
 
-    fn finish(mut self) {
+    /// Waits for the last frames; returns how many could not be written.
+    fn finish(mut self) -> u64 {
         self.tx = None;
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
+        // A thread that panicked lost the frame it held, at least.
+        self.threads.drain(..).map(|t| t.join().unwrap_or(1)).sum()
     }
 }
 
 pub fn save_png(img: &RgbaImage, path: &Path, fast: bool) -> Result<(), String> {
     use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     use image::ImageEncoder;
+    use std::io::Write;
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let compression = if fast { CompressionType::Fast } else { CompressionType::Best };
-    PngEncoder::new_with_quality(std::io::BufWriter::new(file), compression, FilterType::Adaptive)
+    let mut out = std::io::BufWriter::new(file);
+    PngEncoder::new_with_quality(&mut out, compression, FilterType::Adaptive)
         .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())
 }
 
 // ---- window frame -------------------------------------------------------------

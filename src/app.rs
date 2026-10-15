@@ -988,6 +988,7 @@ impl App {
         if let Some(img) = image {
             let [w, h] = img.size;
             let ppp = w as f32 / ctx.screen_rect().width();
+            crate::record::check_scale(ppp);
             let saved = image::RgbaImage::from_raw(w as u32, h as u32, img.as_raw().to_vec())
                 .ok_or_else(|| "bad screenshot buffer".to_string())
                 .and_then(|i| crate::record::save_png(&crate::record::window_frame(&i, ppp), &out, false));
