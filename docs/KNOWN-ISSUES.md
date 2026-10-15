@@ -117,6 +117,21 @@ noted further down.
   "newer version" path is exercised with a lowered version number, and the
   dialog through `--screenshot update`. It will meet a real newer release
   for the first time after the next tag.
+- **A cancelled update download can linger** in the background until its
+  time budget runs out (3 to 30 minutes, from the file size): a blocked
+  network read cannot be interrupted. It never publishes anything once
+  cancelled, and each attempt has its own partial file.
+- **Update publishing on file systems without hard links** (a Downloads
+  folder on FAT or exFAT) falls back to reserving the name, then renaming
+  over the reservation: a file another program writes under that exact
+  name in between would be replaced. Elsewhere the hard link cannot
+  replace anything.
+- **Thumbnail programs** (ffmpeg, Quick Look) are stopped with their whole
+  process group on Unix and their job object on Windows when they exceed
+  6 s. A process that leaves its group (`setsid`), or one started on
+  Windows in the instant before the job is assigned, escapes that.
+  ffmpeg only gets self-contained video formats (`-format_whitelist`) and
+  local files (`-protocol_whitelist file`).
 - **Locally built binaries embed the build machine's home path** in panic
   messages. Publish CI builds only, or add `--remap-path-prefix`.
 

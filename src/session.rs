@@ -464,6 +464,11 @@ impl Session {
         let tree = self.scan.tree.read();
         self.checked.retain(|&id| !tree.is_gone(id));
         drop(tree);
+        // Sizes changed: a folder may no longer match a size filter, and
+        // capped results have room for more.
+        if removed && self.has_search() {
+            self.run_search();
+        }
         self.dirty = true;
     }
 
@@ -890,5 +895,29 @@ mod tests {
         assert_eq!(s.total_size, 903_000_100);
         assert!(s.checked.is_empty());
         assert_eq!(names(&s.columns[0]), ["docs", "Small", "Hidden"]);
+    }
+
+    #[test]
+    fn size_filter_follows_removals() {
+        let mut s = session();
+        let settle = |s: &mut Session| {
+            for _ in 0..500 {
+                s.refresh();
+                if !s.searching {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("search did not finish");
+        };
+        s.set_filter(Filter { min_size: 2_500_000, ..Filter::default() });
+        settle(&mut s);
+        let found = |s: &Session| s.search_rows.iter().any(|r| r.name == "docs");
+        assert!(found(&s), "docs holds 3 MB");
+        s.toggle_check(5, false).unwrap();
+        let results: Vec<OpResult> = s.op_items(None).into_iter().map(|item| OpResult { item, error: None, renamed: None }).collect();
+        s.apply_results(&results, true);
+        settle(&mut s);
+        assert!(!found(&s), "docs holds 1 MB once a.pdf is gone");
     }
 }

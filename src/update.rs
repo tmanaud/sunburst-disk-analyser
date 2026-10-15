@@ -149,15 +149,22 @@ fn plain_notes(markdown: &str) -> String {
     lines.collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
-fn agent(body_timeout: Duration) -> ureq::Agent {
+/// Every request ends within `total`, name lookup and redirects included.
+fn agent(total: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
         .user_agent(concat!("sunburst-disk-analyser/", env!("CARGO_PKG_VERSION")))
+        .timeout_global(Some(total))
+        .timeout_resolve(Some(Duration::from_secs(10)))
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(15)))
-        .timeout_recv_body(Some(body_timeout))
         .build()
         .into()
+}
+
+/// Time allowed for a download: down to about 50 kB/s, within 3 to 30 minutes.
+fn download_time(size: u64) -> Duration {
+    Duration::from_secs((size / 50_000).clamp(180, 30 * 60))
 }
 
 fn unreachable(e: impl std::fmt::Display) -> String {
@@ -194,7 +201,7 @@ pub fn check(ctx: egui::Context) -> Check {
     let out = slot.clone();
     std::thread::spawn(move || {
         let url = format!("https://api.github.com/repos/{}/releases/latest", slug());
-        let outcome = fetch_text(&agent(Duration::from_secs(15)), &url, MAX_ANSWER)
+        let outcome = fetch_text(&agent(Duration::from_secs(20)), &url, MAX_ANSWER)
             .and_then(|json| parse_release(&json, env!("CARGO_PKG_VERSION"), asset_suffix().as_deref()));
         *out.lock() = Some(match outcome {
             Ok(Some(release)) => Outcome::Available(release),
@@ -231,8 +238,9 @@ pub fn download(release: &Release, ctx: egui::Context) -> Option<Arc<Download>> 
     let job = Arc::new(Download { done: AtomicU64::new(0), total: asset.size, cancel: AtomicBool::new(false), result: Mutex::new(None) });
     let out = job.clone();
     std::thread::spawn(move || {
+        // Without a Downloads folder the download fails rather than going elsewhere.
         let result = dirs::download_dir()
-            .or_else(dirs::home_dir)
+            .filter(|d| d.is_dir())
             .ok_or_else(|| t("No Downloads folder was found.").to_string())
             .and_then(|dir| fetch_checked(&asset, sums.as_deref(), &out, &dir));
         *out.result.lock() = Some(result);
@@ -250,23 +258,26 @@ fn expected_hash(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-fn fetch_checked(asset: &Asset, sums: Option<&str>, job: &Download, dir: &Path) -> Result<PathBuf, String> {
-    let agent = agent(Duration::from_secs(30 * 60));
-    let no_sum = || t("The release has no checksum for this file.").to_string();
-    let sums = fetch_text(&agent, sums.ok_or_else(no_sum)?, MAX_SUMS)?;
-    let expected = expected_hash(&sums, &asset.name).ok_or_else(no_sum)?;
-    let temp = dir.join(format!(".{}.{}.part", asset.name, std::process::id()));
-    let saved = save(&agent, asset, &expected, &temp, job).and_then(|()| publish(&temp, dir, &asset.name).map_err(|e| e.to_string()));
-    if saved.is_err() {
-        let _ = std::fs::remove_file(&temp);
+/// A partly downloaded file, deleted unless it was published. Its name is
+/// unique to one download, so no other attempt's file is ever deleted.
+struct Partial(PathBuf);
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    saved
 }
 
-/// Writes the download to `temp` and checks its length and checksum.
-fn save(agent: &ureq::Agent, asset: &Asset, expected: &str, temp: &Path, job: &Download) -> Result<(), String> {
-    let mut answer = agent.get(&asset.url).call().map_err(unreachable)?;
-    let mut body = answer.body_mut().with_config().limit(asset.size + 1).reader();
+fn fetch_checked(asset: &Asset, sums: Option<&str>, job: &Download, dir: &Path) -> Result<PathBuf, String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let no_sum = || t("The release has no checksum for this file.").to_string();
+    let sums = fetch_text(&agent(Duration::from_secs(30)), sums.ok_or_else(no_sum)?, MAX_SUMS)?;
+    let expected = expected_hash(&sums, &asset.name).ok_or_else(no_sum)?;
+    let stopped = || Err(t("The download was stopped.").to_string());
+    if job.cancel.load(Ordering::Acquire) {
+        return stopped();
+    }
+    let temp = dir.join(format!(".{}.{}-{}.part", asset.name, std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -275,7 +286,19 @@ fn save(agent: &ureq::Agent, asset: &Asset, expected: &str, temp: &Path, job: &D
         // An AppImage is the program itself.
         options.mode(if asset.name.ends_with(".AppImage") { 0o755 } else { 0o644 });
     }
-    let mut file = options.open(temp).map_err(|e| e.to_string())?;
+    let file = options.open(&temp).map_err(|e| e.to_string())?;
+    let partial = Partial(temp);
+    save(&agent(download_time(asset.size)), asset, &expected, file, job)?;
+    if job.cancel.load(Ordering::Acquire) {
+        return stopped();
+    }
+    publish(&partial.0, dir, &asset.name).map_err(|e| e.to_string())
+}
+
+/// Writes the download to `file` and checks its length and checksum.
+fn save(agent: &ureq::Agent, asset: &Asset, expected: &str, mut file: std::fs::File, job: &Download) -> Result<(), String> {
+    let mut answer = agent.get(&asset.url).call().map_err(unreachable)?;
+    let mut body = answer.body_mut().with_config().limit(asset.size + 1).reader();
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 << 10];
     let mut done = 0u64;
@@ -311,9 +334,25 @@ fn numbered(name: &str, n: u32) -> String {
     format!("{} ({n}){ext}", &name[..name.len() - ext.len()])
 }
 
-/// Renames `temp` into `dir` under the first free name; an existing file is
-/// never replaced, since the name is reserved before the rename.
+/// Puts `temp` into `dir` under the first free name. A hard link is made, which
+/// fails on an existing name instead of replacing it, even one that appeared
+/// a moment ago; `temp` itself is deleted by its owner afterwards.
 fn publish(temp: &Path, dir: &Path, name: &str) -> io::Result<PathBuf> {
+    for n in 1..1000 {
+        let target = dir.join(numbered(name, n));
+        match std::fs::hard_link(temp, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            // File systems without hard links (FAT, exFAT) take the next way.
+            Err(_) => return publish_by_rename(temp, dir, name),
+        }
+    }
+    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+}
+
+/// Reserves the first free name, then renames over that reservation: an
+/// existing file is never replaced, though one written in between could be.
+fn publish_by_rename(temp: &Path, dir: &Path, name: &str) -> io::Result<PathBuf> {
     for n in 1..1000 {
         let target = dir.join(numbered(name, n));
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
@@ -455,7 +494,10 @@ mod tests {
         assert_eq!(saved, dir.path().join("App (2).dmg"));
         assert_eq!(std::fs::read(dir.path().join("App.dmg")).unwrap(), b"old");
         assert_eq!(std::fs::read(&saved).unwrap(), b"new");
+        // The partial file belongs to its download, which deletes it.
+        drop(Partial(temp.clone()));
         assert!(!temp.exists());
+        assert_eq!(std::fs::read(&saved).unwrap(), b"new");
     }
 
     /// Talks to GitHub: `cargo test -- --ignored published_release_downloads`.

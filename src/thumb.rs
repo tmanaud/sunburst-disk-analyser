@@ -21,6 +21,11 @@ const VIDEOS: &[&str] = &[
 /// it hangs without a word, so they go to ffmpeg.
 const QUICK_LOOK_VIDEOS: &[&str] = &["mov", "mp4", "m4v", "3gp", "3g2", "mpg", "mpeg", "mts", "m2ts"];
 const DOCUMENTS: &[&str] = &["pdf"];
+/// The ffmpeg readers of those videos. Formats that open further files
+/// (playlists, concat lists, HLS, DASH…) are refused: a file that merely
+/// looks like a video could otherwise make ffmpeg read others, cloud-only
+/// ones included.
+const DEMUXERS: &str = "matroska,mov,avi,asf,flv,mpeg,mpegts,ogg";
 
 type Pixels = (PathBuf, Option<egui::ColorImage>);
 
@@ -187,7 +192,8 @@ fn video_frame(path: &Path) -> Option<egui::ColorImage> {
     // A few seconds in, as videos often open on black; a shorter clip yields nothing there.
     for seek in ["3", "0"] {
         let mut cmd = Command::new(ffmpeg);
-        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file", "-ss", seek, "-i"])
+        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file", "-format_whitelist", DEMUXERS])
+            .args(["-ss", seek, "-i"])
             .arg(&input)
             .args(["-frames:v", "1", "-an", "-sn", "-dn", "-vf", &scale, "-f", "image2pipe", "-c:v", "png", "pipe:1"]);
         let png = run(cmd, 64 << 20)?;
@@ -215,9 +221,16 @@ fn ffmpeg() -> Option<&'static Path> {
 
 /// Runs `cmd` and returns what it printed, up to `limit` bytes; `None` when it
 /// fails or takes longer than `WAIT`, as Quick Look does on kinds it cannot read.
+/// The wait covers the output too, and whatever the program started is stopped
+/// with it: an ffmpeg wrapper script may leave a process holding the output open.
 fn run(mut cmd: Command, limit: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -225,26 +238,104 @@ fn run(mut cmd: Command, limit: u64) -> Option<Vec<u8>> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn().ok()?;
+    let group = Group::of(&child);
     let out = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut printed = Vec::new();
         let _ = out.take(limit).read_to_end(&mut printed);
-        printed
+        let _ = tx.send(printed);
     });
-    let started = Instant::now();
+    let deadline = Instant::now() + WAIT;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < WAIT => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => break None,
         }
     };
-    let printed = reader.join().ok()?;
-    status.filter(|s| s.success()).map(|_| printed)
+    let printed = match status {
+        Some(s) if s.success() => rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok(),
+        _ => None,
+    };
+    if printed.is_none() {
+        group.kill();
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    printed
+}
+
+/// The program run for a thumbnail with everything it starts: its own process
+/// group on Unix, a job object on Windows.
+struct Group {
+    #[cfg(unix)]
+    id: i32,
+    #[cfg(windows)]
+    job: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn CreateJobObjectW(attributes: *const std::ffi::c_void, name: *const u16) -> *mut std::ffi::c_void;
+    fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
+    fn TerminateJobObject(job: *mut std::ffi::c_void, code: u32) -> i32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+}
+
+impl Group {
+    #[cfg(unix)]
+    fn of(child: &std::process::Child) -> Group {
+        Group { id: child.id() as i32 }
+    }
+
+    #[cfg(windows)]
+    fn of(child: &std::process::Child) -> Group {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: plain Win32 calls on a live process handle; a null job is never used.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if !job.is_null() && AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                CloseHandle(job);
+                return Group { job: std::ptr::null_mut() };
+            }
+            Group { job }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn of(_child: &std::process::Child) -> Group {
+        Group {}
+    }
+
+    /// Called while the program is still running or has left processes behind,
+    /// so the group still exists and its id cannot belong to anything else.
+    fn kill(&self) {
+        #[cfg(unix)]
+        // SAFETY: kill has no memory preconditions; the group is the child's own.
+        unsafe {
+            libc::kill(-self.id, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if !self.job.is_null() {
+            // SAFETY: the job handle is owned by this value and still open.
+            unsafe {
+                TerminateJobObject(self.job, 1);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Group {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            // SAFETY: closed once, here.
+            unsafe {
+                CloseHandle(self.job);
+            }
+        }
+    }
 }
 
 fn to_pixels(picture: image::DynamicImage) -> egui::ColorImage {
@@ -286,6 +377,35 @@ mod tests {
             assert_eq!(pixels.size, [320, 180]);
             assert!(started.elapsed() < WAIT);
         }
+    }
+
+    /// A text file named like a video must not make ffmpeg open other files.
+    #[test]
+    fn video_playlists_are_refused() {
+        let Some(ffmpeg) = ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.mkv");
+        let made = Command::new(ffmpeg)
+            .args(["-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x90:rate=10"])
+            .arg(&real)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(render(&real).is_some());
+        let fake = dir.path().join("fake.mkv");
+        std::fs::write(&fake, "ffconcat version 1.0\nfile 'real.mkv'\n").unwrap();
+        assert!(render(&fake).is_none());
+    }
+
+    /// A program that leaves a process holding its output open is not waited for.
+    #[cfg(unix)]
+    #[test]
+    fn left_behind_processes_do_not_hold_the_thumbnail() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 & exit 0"]);
+        let started = Instant::now();
+        assert!(run(cmd, 1024).is_none());
+        assert!(started.elapsed() < WAIT + Duration::from_secs(2));
     }
 
     #[test]
