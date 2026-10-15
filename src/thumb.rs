@@ -2,15 +2,24 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::process::{Command, Stdio};
+use std::sync::{mpsc, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Longest side of a thumbnail, in pixels.
 const SIDE: u32 = 640;
 /// Thumbnails kept in memory.
 const KEEP: usize = 24;
+/// Longest wait for a thumbnail; past it the file shows its icon instead.
+const WAIT: Duration = Duration::from_secs(6);
 
 const PICTURES: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif", "ico", "icns", "psd", "svg", "raw", "cr2", "nef", "arw", "dng"];
-const VIDEOS: &[&str] = &["mov", "mp4", "m4v", "mkv", "avi", "webm", "mpg", "mpeg", "wmv", "flv", "3gp", "mts", "m2ts"];
+const VIDEOS: &[&str] = &[
+    "mov", "mp4", "m4v", "mkv", "avi", "webm", "mpg", "mpeg", "wmv", "flv", "3gp", "3g2", "mts", "m2ts", "ts", "ogv", "vob", "asf", "divx", "f4v",
+];
+/// The videos a stock Mac's Quick Look pictures; on the others (mkv, webm, avi…)
+/// it hangs without a word, so they go to ffmpeg.
+const QUICK_LOOK_VIDEOS: &[&str] = &["mov", "mp4", "m4v", "3gp", "3g2", "mpg", "mpeg", "mts", "m2ts"];
 const DOCUMENTS: &[&str] = &["pdf"];
 
 type Pixels = (PathBuf, Option<egui::ColorImage>);
@@ -63,6 +72,11 @@ impl Thumbs {
         }
     }
 
+    /// Sets the thumbnail of a file that is not on disk (demo data).
+    pub fn insert(&mut self, path: PathBuf, texture: egui::TextureHandle) {
+        self.known.insert(path, Some(texture));
+    }
+
     pub fn get(&self, path: &Path) -> Option<&egui::TextureHandle> {
         self.known.get(path)?.as_ref()
     }
@@ -75,69 +89,167 @@ fn extension(path: &Path) -> String {
 /// Whether the file is of a kind this system can picture.
 fn has_thumbnail(path: &Path) -> bool {
     let ext = extension(path);
-    if cfg!(target_os = "macos") {
-        [PICTURES, VIDEOS, DOCUMENTS].concat().contains(&ext.as_str())
-    } else {
-        image::ImageFormat::from_extension(&ext).map(|f| f.reading_enabled()).unwrap_or(false)
+    let ext = ext.as_str();
+    if VIDEOS.contains(&ext) {
+        return ffmpeg().is_some() || (cfg!(target_os = "macos") && QUICK_LOOK_VIDEOS.contains(&ext));
     }
+    if cfg!(target_os = "macos") {
+        PICTURES.contains(&ext) || DOCUMENTS.contains(&ext)
+    } else {
+        image::ImageFormat::from_extension(ext).map(|f| f.reading_enabled()).unwrap_or(false)
+    }
+}
+
+/// Videos go to Quick Look when it knows them and to ffmpeg otherwise;
+/// files whose content is still in the cloud are never read.
+fn render(path: &Path) -> Option<egui::ColorImage> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || cloud_only(&meta) {
+        return None;
+    }
+    let ext = extension(path);
+    if VIDEOS.contains(&ext.as_str()) {
+        #[cfg(target_os = "macos")]
+        if QUICK_LOOK_VIDEOS.contains(&ext.as_str()) {
+            if let Some(pixels) = quick_look(path) {
+                return Some(pixels);
+            }
+        }
+        return video_frame(path);
+    }
+    picture(path, &meta)
 }
 
 /// Quick Look makes the thumbnail, so every kind the system previews is covered.
 #[cfg(target_os = "macos")]
-fn render(path: &Path) -> Option<egui::ColorImage> {
-    use std::os::darwin::fs::MetadataExt;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    /// Set on a file whose content is still in the cloud: reading it would download it.
-    const SF_DATALESS: u32 = 0x4000_0000;
-    extern "C" {
-        fn getpid() -> i32;
-    }
-
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.st_flags() & SF_DATALESS != 0 {
-        return None;
-    }
-    // SAFETY: getpid has no preconditions.
-    let dir = std::env::temp_dir().join(format!("sunburst-thumbs-{}", unsafe { getpid() }));
-    std::fs::create_dir_all(&dir).ok()?;
-    let mut child = Command::new("qlmanage")
-        .args(["-t", "-s", &SIDE.to_string(), "-o"])
-        .arg(&dir)
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let started = Instant::now();
-    while child.try_wait().ok()?.is_none() {
-        if started.elapsed() > Duration::from_secs(15) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    let mut name = path.file_name()?.to_os_string();
-    name.push(".png");
-    let out = dir.join(name);
-    let picture = image::open(&out).ok();
-    let _ = std::fs::remove_file(&out);
-    picture.map(to_pixels)
+fn picture(path: &Path, _meta: &std::fs::Metadata) -> Option<egui::ColorImage> {
+    quick_look(path)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn render(path: &Path) -> Option<egui::ColorImage> {
+fn picture(path: &Path, meta: &std::fs::Metadata) -> Option<egui::ColorImage> {
     // A picture far larger than memory allows is not worth a thumbnail.
-    if std::fs::metadata(path).ok()?.len() > 200_000_000 {
+    if meta.len() > 200_000_000 {
         return None;
     }
     image::open(path).ok().map(to_pixels)
 }
 
+/// Set on a file whose content is still in the cloud: reading it would download it.
+#[cfg(target_os = "macos")]
+fn cloud_only(meta: &std::fs::Metadata) -> bool {
+    use std::os::darwin::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    meta.st_flags() & SF_DATALESS != 0
+}
+
+/// OneDrive "online-only" placeholders.
+#[cfg(windows)]
+fn cloud_only(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    meta.file_attributes() & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn cloud_only(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn quick_look(path: &Path) -> Option<egui::ColorImage> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // A folder per thumbnail, as two files of the same name would share an output name.
+    let dir = std::env::temp_dir()
+        .join(format!("sunburst-thumbs-{}", std::process::id()))
+        .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut cmd = Command::new("/usr/bin/qlmanage");
+    cmd.args(["-t", "-s", &SIDE.to_string(), "-o"]).arg(&dir).arg(path);
+    let made = run(cmd, 1 << 16).is_some();
+    let mut name = path.file_name()?.to_os_string();
+    name.push(".png");
+    let picture = if made { image::open(dir.join(name)).ok() } else { None };
+    let _ = std::fs::remove_dir_all(&dir);
+    picture.map(to_pixels)
+}
+
+/// A frame of the video grabbed by an ffmpeg the user installed; none is bundled.
+fn video_frame(path: &Path) -> Option<egui::ColorImage> {
+    let ffmpeg = ffmpeg()?;
+    // "file:" keeps a path from being read as another protocol, and only local files may be opened.
+    let mut input = std::ffi::OsString::from("file:");
+    input.push(path);
+    let scale = format!("scale=w='min({SIDE},iw)':h='min({SIDE},ih)':force_original_aspect_ratio=decrease");
+    // A few seconds in, as videos often open on black; a shorter clip yields nothing there.
+    for seek in ["3", "0"] {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file", "-ss", seek, "-i"])
+            .arg(&input)
+            .args(["-frames:v", "1", "-an", "-sn", "-dn", "-vf", &scale, "-f", "image2pipe", "-c:v", "png", "pipe:1"]);
+        let png = run(cmd, 64 << 20)?;
+        if !png.is_empty() {
+            return image::load_from_memory_with_format(&png, image::ImageFormat::Png).ok().map(to_pixels);
+        }
+    }
+    None
+}
+
+/// ffmpeg from the PATH, or from where Homebrew and MacPorts put it: apps
+/// opened from the Finder do not get the shell's PATH.
+fn ffmpeg() -> Option<&'static Path> {
+    static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+            let path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+            let usual = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"].map(PathBuf::from);
+            // Relative entries would run whatever ffmpeg lies in the current folder.
+            path.into_iter().chain(usual).filter(|d| d.is_absolute()).map(|d| d.join(name)).find(|f| f.is_file())
+        })
+        .as_deref()
+}
+
+/// Runs `cmd` and returns what it printed, up to `limit` bytes; `None` when it
+/// fails or takes longer than `WAIT`, as Quick Look does on kinds it cannot read.
+fn run(mut cmd: Command, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let out = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut printed = Vec::new();
+        let _ = out.take(limit).read_to_end(&mut printed);
+        printed
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < WAIT => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let printed = reader.join().ok()?;
+    status.filter(|s| s.success()).map(|_| printed)
+}
+
 fn to_pixels(picture: image::DynamicImage) -> egui::ColorImage {
-    let small = picture.thumbnail(SIDE, SIDE).to_rgba8();
+    // Shrunk only: `thumbnail` would also blow a small picture up.
+    let small = if picture.width() > SIDE || picture.height() > SIDE { picture.thumbnail(SIDE, SIDE) } else { picture }.to_rgba8();
     egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw())
 }
 
@@ -150,7 +262,30 @@ mod tests {
         assert!(has_thumbnail(Path::new("/x/Photo.PNG")));
         assert!(!has_thumbnail(Path::new("/x/archive.zip")));
         assert!(!has_thumbnail(Path::new("/x/no-extension")));
-        assert_eq!(has_thumbnail(Path::new("/x/clip.mov")), cfg!(target_os = "macos"));
+        let ffmpeg = ffmpeg().is_some();
+        assert_eq!(has_thumbnail(Path::new("/x/clip.mov")), ffmpeg || cfg!(target_os = "macos"));
+        assert_eq!(has_thumbnail(Path::new("/x/clip.mkv")), ffmpeg);
+    }
+
+    /// Quick Look hangs on mkv, so the frame must come from ffmpeg, and fast.
+    #[test]
+    fn renders_a_video_frame() {
+        let Some(ffmpeg) = ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        for (name, seconds) in [("clip.mkv", "5"), ("short.mkv", "1")] {
+            let file = dir.path().join(name);
+            let made = Command::new(ffmpeg)
+                .args(["-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg(format!("testsrc=duration={seconds}:size=320x180:rate=10"))
+                .arg(&file)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            let started = Instant::now();
+            let pixels = render(&file).expect("thumbnail");
+            assert_eq!(pixels.size, [320, 180]);
+            assert!(started.elapsed() < WAIT);
+        }
     }
 
     #[test]
@@ -159,7 +294,7 @@ mod tests {
         let file = dir.path().join("dot.png");
         image::RgbaImage::from_pixel(40, 20, image::Rgba([200, 30, 30, 255])).save(&file).unwrap();
         let pixels = render(&file).expect("thumbnail");
-        assert!(pixels.size[0] >= pixels.size[1] && pixels.size[0] <= SIDE as usize);
+        assert_eq!(pixels.size, [40, 20]);
         assert!(render(&dir.path().join("missing.png")).is_none());
     }
 }
