@@ -254,26 +254,35 @@ impl Tree {
     }
 
     /// The `limit` largest files (packages count as files), largest first.
+    #[cfg(test)]
     pub fn biggest_files(&self, limit: usize) -> Vec<NodeId> {
+        self.biggest_files_in(&[self.root()], limit)
+    }
+
+    /// The `limit` largest files inside `items`, largest first. A file among
+    /// `items` counts itself; packages count as files.
+    pub fn biggest_files_in(&self, items: &[NodeId], limit: usize) -> Vec<NodeId> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let mut heap: BinaryHeap<Reverse<(u64, NodeId)>> = BinaryHeap::with_capacity(limit + 1);
-        let mut stack = vec![self.root()];
+        let mut stack = Vec::new();
+        let offer = |heap: &mut BinaryHeap<Reverse<(u64, NodeId)>>, id: NodeId, stack: &mut Vec<NodeId>| {
+            let n = &self.nodes[id as usize];
+            if n.is_dir() && !n.is_package() {
+                stack.push(id);
+            } else if heap.len() < limit {
+                heap.push(Reverse((n.size, id)));
+            } else if heap.peek().is_some_and(|Reverse((min, _))| n.size > *min) {
+                heap.pop();
+                heap.push(Reverse((n.size, id)));
+            }
+        };
+        for &id in items {
+            offer(&mut heap, id, &mut stack);
+        }
         while let Some(dir) = stack.pop() {
             for c in self.children(dir) {
-                let n = &self.nodes[c as usize];
-                if n.is_dir() && !n.is_package() {
-                    stack.push(c);
-                    continue;
-                }
-                if heap.len() < limit {
-                    heap.push(Reverse((n.size, c)));
-                } else if let Some(Reverse((min, _))) = heap.peek() {
-                    if n.size > *min {
-                        heap.pop();
-                        heap.push(Reverse((n.size, c)));
-                    }
-                }
+                offer(&mut heap, c, &mut stack);
             }
         }
         let mut v: Vec<(u64, NodeId)> = heap.into_iter().map(|r| r.0).collect();
@@ -389,6 +398,10 @@ mod tests {
         let t = sample();
         let b = t.biggest_files(2);
         assert_eq!(b, vec![4, 2]);
+        // Within some items only: a file counts itself, a folder its content.
+        assert_eq!(t.biggest_files_in(&[1, 3], 10), vec![4, 3, 5]);
+        assert_eq!(t.biggest_files_in(&[2, 1], 2), vec![4, 2]);
+        assert!(t.biggest_files_in(&[], 10).is_empty());
         let s = t.search("B", &Filter::default(), 0, 10, &|| false);
         assert_eq!(s, vec![4, 2]);
         assert!(t.in_hidden(3));

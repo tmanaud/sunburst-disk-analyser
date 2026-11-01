@@ -323,12 +323,16 @@ impl App {
                 Dialog::Help => {
                     ui.set_width(500.0);
                     title(ui, t("Sunburst Disk Analyser Help"));
+                    let keys = if cfg!(target_os = "macos") { ["⌘", "⌥"] } else { ["Ctrl", "Alt"] };
+                    let picking = tf("Shift-click selects every row from the last one clicked; {}-click or {}-click adds or removes one. With several rows selected in a column, the next pane lists the biggest files they hold.", &keys);
                     for line in [
                         t("Pick a disk or folder in the list on the left, or drop one on the window, then click Start Scanning."),
                         t("Folders Outline lists the content by size. Click a folder to open it in the next column; click a file to preview it, double-click it to open it. Scroll sideways to see the earlier columns, or use the arrow keys."),
                         t("In the chart every ring is one folder level. Hover a segment for details, click it to select it, click the centre to go back up."),
                         t("Biggest Files lists the largest files of the whole scan."),
+                        picking.as_str(),
                         t("Tick items, then use the Review button to move them to the Trash, or to move or copy them to another folder."),
+                        t("Shift-click a checkbox to tick or untick every row from the last checkbox clicked."),
                         t("Right-click any item for more actions."),
                     ] {
                         ui.horizontal_top(|ui| {

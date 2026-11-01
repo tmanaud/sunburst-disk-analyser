@@ -41,6 +41,106 @@ pub enum Step {
     Right,
 }
 
+/// A list of rows that can be clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pane {
+    /// An outline column, by index.
+    Column(usize),
+    /// The biggest files of several rows picked in a column.
+    Merged,
+    /// Biggest Files or the search results.
+    Flat,
+}
+
+/// How a row was clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Click {
+    /// Picks that row alone.
+    One,
+    /// Adds the row to the picked ones, or takes it out (Ctrl, ⌘ or Alt).
+    Toggle,
+    /// Picks every row from the anchor to this one (Shift).
+    Range,
+    /// Adds every row from the anchor to this one (Shift with Ctrl, ⌘ or Alt).
+    AddRange,
+}
+
+/// Rows picked together in one list. The row clicked last is kept apart:
+/// in `open` for a column, `focus` for the flat lists, `merged_focus` for
+/// the merged pane.
+#[derive(Clone, Default, Debug)]
+pub struct Picks {
+    /// Every picked row when there are several, empty otherwise.
+    pub many: BTreeSet<NodeId>,
+    /// Where a Shift-click range starts.
+    anchor: Option<NodeId>,
+}
+
+impl Picks {
+    /// Applies a click on `id`. `order` lists the rows as shown, `lead` is
+    /// the row picked so far when there is only one. Returns the row now in
+    /// the lead: the one clicked, or another picked one when it was taken out.
+    fn click(&mut self, order: &[NodeId], lead: Option<NodeId>, id: NodeId, how: Click) -> Option<NodeId> {
+        let pos = |r: NodeId| order.iter().position(|&o| o == r);
+        let mut picked: BTreeSet<NodeId> = if self.many.is_empty() { lead.into_iter().collect() } else { std::mem::take(&mut self.many) };
+        // A range starts at the anchor when it is in this list, else at the lead.
+        let anchor = self.anchor.filter(|&a| pos(a).is_some()).or(lead.filter(|&l| pos(l).is_some()));
+        let range = || -> BTreeSet<NodeId> {
+            match (anchor.and_then(pos), pos(id)) {
+                (Some(a), Some(b)) => order[a.min(b)..=a.max(b)].iter().copied().collect(),
+                _ => BTreeSet::from([id]),
+            }
+        };
+        let mut next = Some(id);
+        match how {
+            Click::One => picked = BTreeSet::from([id]),
+            Click::Toggle => {
+                if picked.remove(&id) {
+                    next = lead.filter(|l| picked.contains(l)).or_else(|| order.iter().rev().find(|r| picked.contains(r)).copied());
+                } else {
+                    picked.insert(id);
+                }
+            }
+            Click::Range => picked = range(),
+            Click::AddRange => picked.extend(range()),
+        }
+        self.anchor = match how {
+            Click::One | Click::Toggle => Some(id),
+            Click::Range | Click::AddRange => anchor.or(Some(id)),
+        };
+        if picked.len() > 1 {
+            self.many = picked;
+        }
+        next
+    }
+
+    /// Keeps only picks that are still listed; one left alone is no longer a group.
+    fn keep(&mut self, listed: impl Fn(NodeId) -> bool) {
+        self.many.retain(|&id| listed(id));
+        if self.many.len() < 2 {
+            self.many.clear();
+        }
+    }
+}
+
+/// Largest files found last, reused while the tree and the question stay the same.
+#[derive(Default)]
+struct Found {
+    key: (u64, usize, Vec<NodeId>),
+    ids: Vec<NodeId>,
+}
+
+impl Found {
+    fn get(&mut self, tree: &Tree, items: Vec<NodeId>, limit: usize) -> &[NodeId] {
+        let key = (tree.generation, limit, items);
+        if self.key != key {
+            self.ids = tree.biggest_files_in(&key.2, limit);
+            self.key = key;
+        }
+        &self.ids
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Check {
     No,
@@ -79,6 +179,19 @@ pub struct Column {
     /// The folder could not be read, or only partly.
     pub denied: bool,
     pub items: Vec<Item>,
+}
+
+impl Column {
+    /// The items listed as rows, in order: groups and summaries are not rows.
+    pub fn ids(&self) -> Vec<NodeId> {
+        self.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Row(r) | Item::Member(r) => Some(r.id),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,6 +239,16 @@ pub struct Session {
     pub hover_from_chart: bool,
     /// Item clicked in a flat list (biggest files, search results).
     pub focus: Option<NodeId>,
+    /// Rows picked together in the column of the last item of `open`. With
+    /// several, the next pane lists the biggest files they hold.
+    pub col: Picks,
+    pub flat: Picks,
+    pub merged: Picks,
+    /// Item clicked in the merged pane.
+    pub merged_focus: Option<NodeId>,
+    pub merged_limit: usize,
+    /// Checkbox clicked last, where a Shift-click on another one starts.
+    tick_anchor: Option<(Pane, NodeId)>,
 
     // Cached view, rebuilt by `refresh`.
     pub columns: Vec<Column>,
@@ -134,6 +257,12 @@ pub struct Session {
     pub seg_checked: Vec<bool>,
     pub biggest: Vec<Row>,
     pub biggest_more: bool,
+    /// Biggest files of the rows picked in `col`, and their total size.
+    pub merged_rows: Vec<Row>,
+    pub merged_more: bool,
+    pub picked_size: u64,
+    biggest_found: Found,
+    merged_found: Found,
     pub crumbs: Vec<(NodeId, String)>,
     pub total_size: u64,
     pub total_items: u32,
@@ -191,11 +320,22 @@ impl Session {
             hover: None,
             hover_from_chart: false,
             focus: None,
+            col: Picks::default(),
+            flat: Picks::default(),
+            merged: Picks::default(),
+            merged_focus: None,
+            merged_limit: 50,
+            tick_anchor: None,
             columns: Vec::new(),
             layout: Layout::default(),
             seg_checked: Vec::new(),
             biggest: Vec::new(),
             biggest_more: false,
+            merged_rows: Vec::new(),
+            merged_more: false,
+            picked_size: 0,
+            biggest_found: Found::default(),
+            merged_found: Found::default(),
             crumbs: Vec::new(),
             total_size: 0,
             total_items: 0,
@@ -215,19 +355,91 @@ impl Session {
 
     /// The item menu commands apply to: the last clicked one, else the folder shown.
     pub fn target(&self) -> NodeId {
-        if self.tab == Tab::Biggest || self.search_open {
+        if self.flat_shown() {
             if let Some(id) = self.focus {
                 return id;
             }
         }
+        if let Some(id) = self.merged_focus.filter(|_| self.many()) {
+            return id;
+        }
         self.open.last().copied().unwrap_or(self.view_root)
     }
 
-    /// The file at the end of the path, shown in the preview pane.
+    /// The file shown in the preview pane: the one at the end of the path, or
+    /// the one clicked in the merged pane.
     pub fn selected_file(&self) -> Option<NodeId> {
-        let id = *self.open.last()?;
+        let id = if self.many() { self.merged_focus? } else { *self.open.last()? };
         let tree = self.scan.tree.read();
         (!tree.node(id).is_dir() && !tree.is_gone(id)).then_some(id)
+    }
+
+    /// Biggest Files or the search results are shown instead of the outline.
+    pub fn flat_shown(&self) -> bool {
+        self.tab == Tab::Biggest || self.search_open
+    }
+
+    /// Several rows are picked in an outline column: the merged pane follows it.
+    pub fn many(&self) -> bool {
+        !self.col.many.is_empty()
+    }
+
+    /// The rows of a list, as shown.
+    fn order(&self, pane: Pane) -> Vec<NodeId> {
+        let ids = |rows: &[Row]| rows.iter().map(|r| r.id).collect();
+        match pane {
+            Pane::Column(ci) => self.columns.get(ci).map(|c| c.ids()).unwrap_or_default(),
+            Pane::Merged => ids(&self.merged_rows),
+            Pane::Flat => ids(self.flat_rows()),
+        }
+    }
+
+    pub fn flat_rows(&self) -> &[Row] {
+        if self.search_open {
+            &self.search_rows
+        } else {
+            &self.biggest
+        }
+    }
+
+    /// Whether a row is picked, alone or with others.
+    pub fn is_picked(&self, pane: Pane, id: NodeId) -> bool {
+        match pane {
+            Pane::Column(ci) => self.open.get(ci) == Some(&id) || (ci + 1 == self.open.len() && self.col.many.contains(&id)),
+            Pane::Merged => self.merged_focus == Some(id) || self.merged.many.contains(&id),
+            Pane::Flat => self.focus == Some(id) || self.flat.many.contains(&id),
+        }
+    }
+
+    /// The rows picked together with `id`, when it is one of several.
+    pub fn picked_with(&self, pane: Pane, id: NodeId) -> Option<&BTreeSet<NodeId>> {
+        let picks = match pane {
+            Pane::Column(ci) if ci + 1 == self.open.len() => &self.col,
+            Pane::Column(_) => return None,
+            Pane::Merged => &self.merged,
+            Pane::Flat => &self.flat,
+        };
+        picks.many.contains(&id).then_some(&picks.many)
+    }
+
+    /// Whether the chart outlines `id`: it is picked in the list in sight.
+    pub fn is_marked(&self, id: NodeId) -> bool {
+        if self.flat_shown() {
+            self.is_picked(Pane::Flat, id)
+        } else if self.many() {
+            self.col.many.contains(&id) || self.is_picked(Pane::Merged, id)
+        } else {
+            self.open.last() == Some(&id)
+        }
+    }
+
+    /// Several rows are picked in the list in sight.
+    pub fn has_picks(&self) -> bool {
+        if self.flat_shown() {
+            !self.flat.many.is_empty()
+        } else {
+            self.many()
+        }
     }
 
     pub fn path_of(&self, id: NodeId) -> PathBuf {
@@ -236,8 +448,17 @@ impl Session {
 
     // ---- navigation -------------------------------------------------------
 
-    /// Moves to `path`, a chain of items below the scan root.
+    /// Moves to `path`, a chain of items below the scan root, its last item picked alone.
     fn go(&mut self, path: Vec<NodeId>, keys: bool) {
+        if self.many() {
+            self.dirty = true;
+        }
+        self.col = Picks { many: BTreeSet::new(), anchor: path.last().copied() };
+        self.walk(path, keys);
+    }
+
+    /// Moves to `path`, leaving the picked rows as they are.
+    fn walk(&mut self, path: Vec<NodeId>, keys: bool) {
         if path == self.open {
             return;
         }
@@ -328,6 +549,7 @@ impl Session {
             }
             if path != self.open {
                 self.view_root = centre_of(&path);
+                self.col = Picks { many: BTreeSet::new(), anchor: path.last().copied() };
                 self.open = path;
                 self.hist_keys = false;
                 self.nav_seq += 1;
@@ -341,19 +563,15 @@ impl Session {
     /// An arrow key: up and down move in the column of the selected item,
     /// left and right change column.
     pub fn step(&mut self, step: Step) {
+        if self.many() {
+            // The keys move from the row clicked last, alone again.
+            self.col.many.clear();
+            self.dirty = true;
+        }
         if self.dirty {
             // The columns must match `open` before they are used to move in it.
             self.rebuild(self.scan.is_done());
         }
-        let ids = |c: &Column| -> Vec<NodeId> {
-            c.items
-                .iter()
-                .filter_map(|i| match i {
-                    Item::Row(r) | Item::Member(r) => Some(r.id),
-                    _ => None,
-                })
-                .collect()
-        };
         let mut path = self.open.clone();
         let next = match (step, path.pop()) {
             (Step::Left, Some(_)) => None,
@@ -361,12 +579,12 @@ impl Session {
             // Into the folder just left on the path, or the first column when nothing is selected.
             (Step::Right, last) => {
                 path.extend(last);
-                self.columns.get(path.len()).and_then(|c| ids(c).first().copied())
+                self.columns.get(path.len()).and_then(|c| c.ids().first().copied())
             }
-            (_, None) => self.columns.first().and_then(|c| ids(c).first().copied()),
+            (_, None) => self.columns.first().and_then(|c| c.ids().first().copied()),
             (_, Some(last)) => {
                 let Some(col) = self.columns.get(path.len()) else { return };
-                let ids = ids(col);
+                let ids = col.ids();
                 let Some(i) = ids.iter().position(|&id| id == last) else { return };
                 let j = if step == Step::Down { i + 1 } else { i.wrapping_sub(1) };
                 ids.get(j).copied()
@@ -387,11 +605,138 @@ impl Session {
         self.dirty = true;
     }
 
+    // ---- picking several rows ---------------------------------------------
+
+    /// A row of `pane` was clicked, alone or with Shift, Ctrl (⌘) or Alt.
+    pub fn click(&mut self, pane: Pane, id: NodeId, how: Click) {
+        if self.dirty {
+            // A range is taken from the rows as shown.
+            self.rebuild(self.scan.is_done());
+        }
+        let order = self.order(pane);
+        match pane {
+            Pane::Column(ci) => {
+                // Rows picked in another column do not mix with this one.
+                if ci + 1 != self.open.len() {
+                    self.col.many.clear();
+                }
+                let before = self.col.many.clone();
+                let mut picks = std::mem::take(&mut self.col);
+                let next = picks.click(&order, self.open.get(ci).copied(), id, how);
+                let mut path = self.open[..ci.min(self.open.len())].to_vec();
+                path.extend(next);
+                self.walk(path, false);
+                if picks.many != before {
+                    self.merged_limit = 50;
+                }
+                self.col = picks;
+            }
+            Pane::Merged => {
+                let focus = self.merged.click(&order, self.merged_focus, id, how);
+                if focus != self.merged_focus {
+                    // The columns slide to the preview of the file clicked.
+                    self.nav_seq += 1;
+                }
+                self.merged_focus = focus;
+            }
+            Pane::Flat => self.focus = self.flat.click(&order, self.focus, id, how),
+        }
+        self.dirty = true;
+    }
+
+    /// Shift with an arrow key: the rows picked in the column of the row
+    /// clicked last run to the one above or below.
+    pub fn extend(&mut self, step: Step) {
+        if self.dirty {
+            self.rebuild(self.scan.is_done());
+        }
+        let Some(&lead) = self.open.last() else { return self.step(step) };
+        let ci = self.open.len() - 1;
+        let order = self.order(Pane::Column(ci));
+        let Some(i) = order.iter().position(|&id| id == lead) else { return };
+        let j = match step {
+            Step::Down => i + 1,
+            Step::Up => i.wrapping_sub(1),
+            _ => return,
+        };
+        if let Some(&next) = order.get(j) {
+            self.click(Pane::Column(ci), next, Click::Range);
+        }
+    }
+
+    /// Leaves the row clicked last alone in the list in sight, or in the
+    /// merged pane first when it holds several. Returns false when nothing changed.
+    pub fn unpick(&mut self) -> bool {
+        let (picks, lead) = if self.flat_shown() {
+            (&mut self.flat, self.focus)
+        } else if !self.merged.many.is_empty() {
+            (&mut self.merged, self.merged_focus)
+        } else {
+            (&mut self.col, self.open.last().copied())
+        };
+        let changed = !picks.many.is_empty();
+        picks.many.clear();
+        // A range starts afresh from the row left.
+        picks.anchor = lead;
+        self.dirty |= changed;
+        changed
+    }
+
+    pub fn more_merged(&mut self) {
+        self.merged_limit += 50;
+        self.dirty = true;
+    }
+
     // ---- selection --------------------------------------------------------
 
     pub fn toggle_check(&mut self, id: NodeId, allow_hidden: bool) -> Result<(), CheckError> {
         if self.checked.remove(&id) {
             self.dirty = true;
+            return Ok(());
+        }
+        self.check(id, allow_hidden)
+    }
+
+    /// The checkbox of `id` in `pane` was clicked; with `range` (Shift), every
+    /// row from the checkbox clicked before in the same list takes its new state.
+    pub fn tick(&mut self, pane: Pane, id: NodeId, range: bool, allow_hidden: bool) -> Option<CheckError> {
+        let from = self.tick_anchor.filter(|a| range && a.0 == pane).map(|a| a.1);
+        self.tick_anchor = Some((pane, id));
+        let order = self.order(pane);
+        let pos = |r: NodeId| order.iter().position(|&o| o == r);
+        match (from.and_then(pos), pos(id)) {
+            (Some(a), Some(b)) if a != b => {
+                let on = !self.checked.contains(&id);
+                self.set_checks(&order[a.min(b)..=a.max(b)], on, allow_hidden)
+            }
+            _ => self.toggle_check(id, allow_hidden).err(),
+        }
+    }
+
+    /// Ticks or unticks several items. Returns why some could not be ticked.
+    pub fn set_checks(&mut self, ids: &[NodeId], on: bool, allow_hidden: bool) -> Option<CheckError> {
+        self.dirty = true;
+        if !on {
+            for id in ids {
+                self.checked.remove(id);
+            }
+            return None;
+        }
+        let (mut ticked, mut refused, mut covered) = (false, None, false);
+        for &id in ids {
+            match self.check(id, allow_hidden) {
+                Ok(()) => ticked = true,
+                // Inside a ticked folder: it goes with it already.
+                Err(CheckError::ParentSelected) => covered = true,
+                Err(e) => refused = refused.or(Some(e)),
+            }
+        }
+        refused.or((covered && !ticked).then_some(CheckError::ParentSelected))
+    }
+
+    /// Ticks `id` unless the selection rules forbid it.
+    fn check(&mut self, id: NodeId, allow_hidden: bool) -> Result<(), CheckError> {
+        if self.checked.contains(&id) {
             return Ok(());
         }
         let tree = self.scan.tree.read();
@@ -412,7 +757,7 @@ impl Session {
             return Err(CheckError::Empty);
         }
         // A selected folder already covers everything inside it.
-        let covered: Vec<NodeId> = self.checked.iter().copied().filter(|&c| tree.is_ancestor(id, c)).collect();
+        let covered: Vec<NodeId> = if n.is_dir() { self.checked.iter().copied().filter(|&c| tree.is_ancestor(id, c)).collect() } else { Vec::new() };
         drop(tree);
         for c in covered {
             self.checked.remove(&c);
@@ -427,10 +772,11 @@ impl Session {
         self.dirty = true;
     }
 
-    pub fn op_items(&self, only: Option<NodeId>) -> Vec<OpItem> {
+    /// What an operation acts on: the ticked items, or `only` these ones.
+    pub fn op_items(&self, only: Option<&[NodeId]>) -> Vec<OpItem> {
         let tree = self.scan.tree.read();
         let ids: Vec<NodeId> = match only {
-            Some(id) => vec![id],
+            Some(ids) => ids.to_vec(),
             None => self.checked.iter().copied().collect(),
         };
         let mut items: Vec<OpItem> = ids
@@ -557,12 +903,22 @@ impl Session {
 
     fn rebuild(&mut self, done: bool) {
         let tree = self.scan.tree.read();
-        // A removed item ends the path.
+        // A removed item ends the path. When it was picked with other rows,
+        // one of those that are left takes its place.
+        self.col.many.retain(|&id| !tree.is_gone(id));
         if let Some(i) = self.open.iter().position(|&id| tree.is_gone(id)) {
             self.open.truncate(i);
+            self.open.extend(self.col.many.iter().next_back());
             self.history[self.hist_pos] = self.open.clone();
             self.nav_seq += 1;
         }
+        // Rows stay picked together only next to the row clicked last.
+        let lead = self.open.last().map(|&l| (l, tree.node(l).parent));
+        let siblings = lead.is_some_and(|(l, parent)| self.col.many.contains(&l) && self.col.many.iter().all(|&id| tree.node(id).parent == parent));
+        if self.col.many.len() < 2 || !siblings {
+            self.col.many.clear();
+        }
+        let many = !self.col.many.is_empty();
         self.view_root = centre_of(&self.open);
         let root = tree.node(tree.root());
         self.total_size = root.size;
@@ -588,31 +944,30 @@ impl Session {
                 Check::No
             }
         };
-        let row = |id: NodeId, crumbs: bool| -> Row {
+        let row = |id: NodeId, crumbs: Vec<String>| -> Row {
             let n = tree.node(id);
-            Row {
-                id,
-                name: n.display_name(),
-                size: n.size,
-                flags: n.flags,
-                check: check_of(id),
-                hidden: tree.in_hidden(id),
-                crumbs: if crumbs {
-                    let chain = tree.chain(n.parent);
-                    chain
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &a)| if i == 0 { self.name.clone() } else { tree.node(a).display_name() })
-                        .collect()
-                } else {
-                    Vec::new()
-                },
+            Row { id, name: n.display_name(), size: n.size, flags: n.flags, check: check_of(id), hidden: tree.in_hidden(id), crumbs }
+        };
+        let name_of = |id: NodeId| if id == tree.root() { self.name.clone() } else { tree.node(id).display_name() };
+        // The folders holding an item, from the scan root down.
+        let path_to = |id: NodeId| -> Vec<String> { tree.chain(tree.node(id).parent).into_iter().map(name_of).collect() };
+        // The same below `base`, the folder all rows of the merged pane share;
+        // just its name for an item right inside it.
+        let path_below = |id: NodeId, base: NodeId| -> Vec<String> {
+            let chain = tree.chain(tree.node(id).parent);
+            let below: Vec<String> = chain.into_iter().skip_while(|&a| a != base).skip(1).map(name_of).collect();
+            if below.is_empty() {
+                vec![name_of(base)]
+            } else {
+                below
             }
         };
 
-        // Columns: the scan root, then every opened folder.
+        // Columns: the scan root, then every opened folder, but not the content
+        // of rows picked together: the merged pane comes in its place.
+        let shown = if many { &self.open[..self.open.len() - 1] } else { &self.open[..] };
         let mut dirs = vec![tree.root()];
-        dirs.extend(self.open.iter().copied().filter(|&id| tree.node(id).is_dir()));
+        dirs.extend(shown.iter().copied().filter(|&id| tree.node(id).is_dir()));
         self.columns.clear();
         for (ci, dir) in dirs.into_iter().enumerate() {
             let psize = tree.node(dir).size;
@@ -634,7 +989,7 @@ impl Session {
             let extra = normal.len().saturating_sub(MAX_ROWS);
             // A clicked item stays listed even when it is beyond the cut.
             let pinned: Vec<NodeId> = normal.iter().skip(MAX_ROWS).copied().filter(|c| self.open.contains(c)).collect();
-            items.extend(normal.into_iter().take(MAX_ROWS).chain(pinned).map(|c| Item::Row(row(c, false))));
+            items.extend(normal.into_iter().take(MAX_ROWS).chain(pinned).map(|c| Item::Row(row(c, Vec::new()))));
             if extra > 0 {
                 items.push(Item::More(extra));
             }
@@ -647,7 +1002,7 @@ impl Session {
                 if open {
                     let extra = list.len().saturating_sub(MAX_ROWS);
                     let pinned: Vec<NodeId> = list.iter().skip(MAX_ROWS).copied().filter(|c| self.open.contains(c)).collect();
-                    items.extend(list.into_iter().take(MAX_ROWS).chain(pinned).map(|c| Item::Member(row(c, false))));
+                    items.extend(list.into_iter().take(MAX_ROWS).chain(pinned).map(|c| Item::Member(row(c, Vec::new()))));
                     if extra > 0 {
                         items.push(Item::More(extra));
                     }
@@ -680,22 +1035,41 @@ impl Session {
         }
 
         if self.tab == Tab::Biggest {
-            let ids = tree.biggest_files(self.biggest_limit + 1);
+            let ids = self.biggest_found.get(&tree, vec![tree.root()], self.biggest_limit + 1);
             self.biggest_more = ids.len() > self.biggest_limit;
-            self.biggest = ids.into_iter().take(self.biggest_limit).map(|id| row(id, true)).collect();
+            self.biggest = ids.iter().take(self.biggest_limit).map(|&id| row(id, path_to(id))).collect();
         }
         self.search_rows = self
             .search_hits
             .iter()
             .filter(|&&id| !tree.is_gone(id))
-            .map(|&id| row(id, true))
+            .map(|&id| row(id, path_to(id)))
             .collect();
+        let flat_ids: HashSet<NodeId> = self.flat_rows().iter().map(|r| r.id).collect();
+        self.flat.keep(|id| flat_ids.contains(&id));
 
-        // Breadcrumbs: from the scan root to the last opened item.
+        // The biggest files of the rows picked together.
+        if many {
+            let base = tree.node(self.open[self.open.len() - 1]).parent;
+            let items: Vec<NodeId> = self.col.many.iter().copied().collect();
+            self.picked_size = items.iter().map(|&id| tree.node(id).size).sum();
+            let ids = self.merged_found.get(&tree, items, self.merged_limit + 1);
+            self.merged_more = ids.len() > self.merged_limit;
+            self.merged_rows = ids.iter().take(self.merged_limit).map(|&id| row(id, path_below(id, base))).collect();
+        } else {
+            self.merged_rows.clear();
+            self.merged_more = false;
+            self.picked_size = 0;
+        }
+        let merged_ids: HashSet<NodeId> = self.merged_rows.iter().map(|r| r.id).collect();
+        self.merged.keep(|id| merged_ids.contains(&id));
+        self.merged_focus = self.merged_focus.filter(|id| merged_ids.contains(id));
+
+        // Breadcrumbs: from the scan root to the last opened item, or to the
+        // folder of the rows picked together.
         self.crumbs.clear();
-        for (i, id) in std::iter::once(tree.root()).chain(self.open.iter().copied()).enumerate() {
-            let name = if i == 0 { self.name.clone() } else { tree.node(id).display_name() };
-            self.crumbs.push((id, name));
+        for id in std::iter::once(tree.root()).chain(shown.iter().copied()) {
+            self.crumbs.push((id, name_of(id)));
         }
 
         self.checked.retain(|&id| !tree.is_gone(id));
@@ -882,6 +1256,151 @@ mod tests {
             Item::Row(r) => assert_eq!(r.check, Check::Inherited),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn ids(set: &BTreeSet<NodeId>) -> Vec<NodeId> {
+        set.iter().copied().collect()
+    }
+
+    #[test]
+    fn rows_picked_together_show_their_biggest_files() {
+        let mut s = session();
+        s.click(Pane::Column(0), 2, Click::One);
+        assert_eq!((s.open.clone(), s.many()), (vec![2], false));
+        // Ctrl (⌘) or Alt adds a row; the merged pane takes the place of its content.
+        s.click(Pane::Column(0), 1, Click::Toggle);
+        s.refresh();
+        assert_eq!((s.open.clone(), ids(&s.col.many)), (vec![1], vec![1, 2]), "the row clicked last leads");
+        assert_eq!(s.columns.len(), 1, "no column for the content of docs");
+        assert_eq!(s.merged_rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["movie.mkv", "a.pdf", "b.pdf"]);
+        assert_eq!((s.merged_rows[0].crumbs.clone(), s.merged_rows[1].crumbs.clone()), (vec!["root".to_string()], vec!["docs".to_string()]));
+        assert_eq!(s.picked_size, 5_003_000_000);
+        assert_eq!(s.crumbs.iter().map(|c| c.1.as_str()).collect::<Vec<_>>(), ["root"]);
+        assert!(s.is_marked(1) && s.is_marked(2) && !s.is_marked(5));
+        assert_eq!(s.picked_with(Pane::Column(0), 2).map(ids), Some(vec![1, 2]));
+        // A file clicked in the merged pane is previewed and is what the menus act on.
+        s.click(Pane::Merged, 5, Click::One);
+        assert_eq!((s.selected_file(), s.target(), s.is_marked(5)), (Some(5), 5, true));
+        // Taking a row out leaves the other one alone, with its own pane back.
+        s.click(Pane::Column(0), 1, Click::Toggle);
+        s.refresh();
+        assert_eq!((s.open.clone(), s.many(), s.selected_file()), (vec![2], false, Some(2)));
+        assert!(s.merged_rows.is_empty() && s.merged_focus.is_none());
+        // Taking the last one out leaves nothing picked in the column.
+        s.click(Pane::Column(0), 2, Click::Toggle);
+        assert_eq!(s.open, Vec::<NodeId>::new());
+    }
+
+    #[test]
+    fn shift_picks_a_range_and_escape_drops_it() {
+        let mut s = session();
+        s.toggle_group(0, GroupKind::Small);
+        s.refresh();
+        // Rows: movie.mkv, docs, then note.txt in the open group of small items.
+        s.click(Pane::Column(0), 2, Click::One);
+        s.click(Pane::Column(0), 4, Click::Range);
+        assert_eq!((ids(&s.col.many), s.open.clone()), (vec![1, 2, 4], vec![4]));
+        // The range keeps its start: a shorter one replaces it.
+        s.click(Pane::Column(0), 1, Click::Range);
+        assert_eq!(ids(&s.col.many), vec![1, 2]);
+        s.click(Pane::Column(0), 4, Click::Toggle);
+        s.click(Pane::Column(0), 2, Click::Toggle);
+        assert_eq!(ids(&s.col.many), vec![1, 4]);
+        // Shift with Ctrl adds the range from the row toggled last.
+        s.click(Pane::Column(0), 2, Click::AddRange);
+        assert_eq!(ids(&s.col.many), vec![1, 2, 4]);
+        // Escape leaves the row clicked last alone.
+        assert!(s.unpick());
+        s.refresh();
+        assert_eq!((s.open.clone(), s.many()), (vec![2], false));
+        assert!(!s.unpick());
+        // Shift with an arrow key picks the rows passed, and gives them back.
+        s.extend(Step::Down);
+        s.extend(Step::Down);
+        assert_eq!((ids(&s.col.many), s.open.clone()), (vec![1, 2, 4], vec![4]));
+        s.extend(Step::Up);
+        assert_eq!(ids(&s.col.many), vec![1, 2]);
+        // A plain arrow key moves from the row clicked last, alone.
+        s.step(Step::Up);
+        assert_eq!((s.open.clone(), s.many()), (vec![2], false));
+        // Picks in a column do not mix with those of another.
+        s.click(Pane::Column(0), 1, Click::One);
+        s.refresh();
+        s.click(Pane::Column(1), 5, Click::One);
+        s.click(Pane::Column(0), 4, Click::Toggle);
+        assert_eq!((ids(&s.col.many), s.open.clone()), (vec![1, 4], vec![4]));
+    }
+
+    #[test]
+    fn removing_the_row_clicked_last_keeps_the_others_picked() {
+        let mut s = session();
+        s.toggle_group(0, GroupKind::Small);
+        s.refresh();
+        s.click(Pane::Column(0), 2, Click::One);
+        s.click(Pane::Column(0), 4, Click::Range);
+        // As `apply_results` does after a removal.
+        let remove = |s: &mut Session, id: NodeId| {
+            s.scan.tree.write().remove(id);
+            s.mark_dirty();
+            s.refresh();
+        };
+        remove(&mut s, 4);
+        assert_eq!((s.open.clone(), ids(&s.col.many)), (vec![2], vec![1, 2]));
+        // With one left, it is picked alone.
+        remove(&mut s, 2);
+        assert_eq!((s.open.clone(), s.many()), (vec![1], false));
+    }
+
+    #[test]
+    fn rows_picked_in_biggest_files() {
+        let mut s = session();
+        s.tab = Tab::Biggest;
+        s.mark_dirty();
+        s.refresh();
+        assert_eq!(s.biggest.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2, 7, 5, 6, 4]);
+        s.click(Pane::Flat, 7, Click::One);
+        s.click(Pane::Flat, 6, Click::Range);
+        s.click(Pane::Flat, 4, Click::Toggle);
+        assert_eq!((ids(&s.flat.many), s.focus), (vec![4, 5, 6, 7], Some(4)));
+        assert!(s.has_picks() && s.is_marked(5) && !s.is_marked(2));
+        assert_eq!(s.picked_with(Pane::Flat, 2), None);
+        // Ticking them all skips what may not be ticked, and tells why.
+        let picked = ids(&s.flat.many);
+        assert_eq!(s.set_checks(&picked, true, false), Some(CheckError::Hidden));
+        assert_eq!(s.checked.iter().copied().collect::<Vec<_>>(), vec![4, 5, 6]);
+        assert_eq!(s.set_checks(&picked, false, false), None);
+        assert!(s.checked.is_empty());
+        // Escape, or a plain click, leaves one row picked.
+        assert!(s.unpick());
+        assert_eq!((s.has_picks(), s.focus), (false, Some(4)));
+        s.click(Pane::Flat, 2, Click::Range);
+        s.click(Pane::Flat, 6, Click::One);
+        assert_eq!((s.has_picks(), s.focus), (false, Some(6)));
+    }
+
+    #[test]
+    fn shift_click_on_checkboxes_ticks_a_range() {
+        let mut s = session();
+        s.toggle_group(0, GroupKind::Small);
+        s.toggle_group(0, GroupKind::Hidden);
+        s.refresh();
+        // Rows: movie.mkv, docs, note.txt, then .cache in the group of hidden items.
+        assert_eq!(s.tick(Pane::Column(0), 2, false, false), None);
+        assert_eq!(s.tick(Pane::Column(0), 4, true, false), None);
+        assert_eq!(s.checked.iter().copied().collect::<Vec<_>>(), vec![1, 2, 4]);
+        // From a ticked box, Shift unticks the range.
+        assert_eq!(s.tick(Pane::Column(0), 1, true, false), None);
+        assert_eq!(s.checked.iter().copied().collect::<Vec<_>>(), vec![2]);
+        // Items that may not be ticked are left out, and the reason told.
+        assert_eq!(s.tick(Pane::Column(0), 3, true, false), Some(CheckError::Hidden));
+        assert_eq!(s.checked.iter().copied().collect::<Vec<_>>(), vec![1, 2, 4]);
+        // A range does not start from a box of another list.
+        s.select(0, 1);
+        s.refresh();
+        assert_eq!(s.tick(Pane::Column(1), 6, true, false), Some(CheckError::ParentSelected));
+        // Items inside a ticked folder go with it already.
+        assert_eq!(s.set_checks(&[5, 2], true, false), None);
+        assert_eq!(s.set_checks(&[5, 6], true, false), Some(CheckError::ParentSelected));
     }
 
     #[test]

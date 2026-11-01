@@ -4,7 +4,7 @@ use crate::i18n::{self, t, tf};
 use crate::ops::{self, OpKind, OpProgress};
 use crate::platform::{self, LocKind, Location, Space};
 use crate::scan::{self, ScanHandle};
-use crate::session::{CheckError, GroupKind, Session, Step, Tab};
+use crate::session::{CheckError, Click, GroupKind, Pane, Session, Step, Tab};
 use crate::swipe::Swipe;
 use crate::settings::{Appearance, Settings};
 use crate::theme::{self, Palette};
@@ -71,22 +71,33 @@ pub enum Action {
     Cmd(Cmd),
     SelectLocation(Location),
     RemoveFavorite(PathBuf),
-    RowClick { col: usize, id: NodeId },
-    FlatClick(NodeId),
+    /// A row was clicked, alone or with Shift, Ctrl (⌘) or Alt.
+    Pick { pane: Pane, id: NodeId, how: Click },
     SelectPath(NodeId),
     Step(Step),
+    /// Shift with an arrow key.
+    Extend(Step),
+    /// Escape: the row clicked last alone again.
+    Unpick,
     /// Open a file with its default application.
     Open(NodeId),
     Hover(NodeId, bool),
     ToggleCheck(NodeId),
+    /// The checkbox of a row was clicked; `range` with Shift.
+    Tick { pane: Pane, id: NodeId, range: bool },
+    /// Tick (`true`) or untick several items at once.
+    SetChecks(Vec<NodeId>, bool),
     ToggleGroup(NodeId, GroupKind),
     Crumb(NodeId),
     MoreBiggest,
+    MoreMerged,
     SetQuery(String),
     SetFilter(crate::filter::Filter),
     CloseSearch,
     /// A command applied to a specific item (context menus).
     On(Cmd, NodeId),
+    /// A command applied to several picked items: remove, move, copy or copy their paths.
+    OnMany(Cmd, Vec<NodeId>),
     QuickRemove(NodeId),
     SetOpMode(OpKind),
     Review,
@@ -95,6 +106,16 @@ pub enum Action {
     /// A pane edge was dragged: new width of the outline columns, or of the flat lists.
     /// `done` ends the drag.
     PaneWidth { flat: bool, width: f32, done: bool },
+}
+
+/// The operation a command starts, if it starts one.
+fn op_kind(cmd: Cmd) -> Option<OpKind> {
+    match cmd {
+        Cmd::Remove => Some(OpKind::Remove),
+        Cmd::Move => Some(OpKind::Move),
+        Cmd::Copy => Some(OpKind::Copy),
+        _ => None,
+    }
 }
 
 pub struct ReviewItem {
@@ -425,7 +446,7 @@ impl App {
         }
     }
 
-    fn open_review(&mut self, kind: OpKind, only: Option<NodeId>) {
+    fn open_review(&mut self, kind: OpKind, only: Option<&[NodeId]>) {
         if self.is_scanning() {
             self.toast(t("Wait until the scan is finished."));
             return;
@@ -680,18 +701,23 @@ impl App {
         let allow_hidden = self.settings.allow_removing_hidden;
         match action {
             Action::Cmd(c) => self.run_cmd(c, None, ctx),
-            Action::On(c, id) => match c {
-                Cmd::Remove | Cmd::Move | Cmd::Copy => {
-                    let kind = match c {
-                        Cmd::Move => OpKind::Move,
-                        Cmd::Copy => OpKind::Copy,
-                        _ => OpKind::Remove,
-                    };
-                    self.review_single(kind, id);
-                }
-                _ => self.run_cmd(c, Some(id), ctx),
+            Action::On(c, id) => match op_kind(c) {
+                Some(kind) => self.review_items(kind, &[id]),
+                None => self.run_cmd(c, Some(id), ctx),
             },
-            Action::QuickRemove(id) => self.review_single(OpKind::Remove, id),
+            Action::OnMany(c, ids) => match op_kind(c) {
+                Some(kind) => self.review_items(kind, &ids),
+                None if c == Cmd::CopyPath => {
+                    let Some(s) = self.session() else { return };
+                    let tree = s.scan.tree.read();
+                    let paths: Vec<String> = ids.iter().map(|&id| tree.path(id).to_string_lossy().into_owned()).collect();
+                    drop(tree);
+                    ctx.copy_text(paths.join("\n"));
+                    self.toast(t("Paths copied."));
+                }
+                None => {}
+            },
+            Action::QuickRemove(id) => self.review_items(OpKind::Remove, &[id]),
             Action::Open(id) => {
                 if let Some(p) = self.target_path(Some(id)).filter(|_| !self.opts.demo) {
                     platform::open_file(&p);
@@ -731,23 +757,27 @@ impl App {
                 let mut error = None;
                 let Some(s) = self.session_mut() else { return };
                 match other {
-                    Action::RowClick { col, id } => s.select(col, id),
-                    Action::FlatClick(id) => {
-                        s.focus = Some(id);
-                    }
+                    Action::Pick { pane, id, how } => s.click(pane, id, how),
                     Action::SelectPath(id) => s.select_path(id),
                     Action::Step(step) => s.step(step),
+                    Action::Extend(step) => s.extend(step),
+                    Action::Unpick => {
+                        s.unpick();
+                    }
                     Action::Hover(id, from_chart) => {
                         s.hover = Some(id);
                         s.hover_from_chart = from_chart;
                     }
                     Action::ToggleCheck(id) => error = s.toggle_check(id, allow_hidden).err(),
+                    Action::Tick { pane, id, range } => error = s.tick(pane, id, range, allow_hidden),
+                    Action::SetChecks(ids, on) => error = s.set_checks(&ids, on, allow_hidden),
                     Action::ToggleGroup(dir, kind) => s.toggle_group(dir, kind),
                     Action::Crumb(id) => s.go_crumb(id),
                     Action::MoreBiggest => {
                         s.biggest_limit += 50;
                         s.mark_dirty();
                     }
+                    Action::MoreMerged => s.more_merged(),
                     Action::SetQuery(q) => s.set_query(q),
                     Action::SetFilter(f) => s.set_filter(f),
                     Action::CloseSearch => {
@@ -765,26 +795,42 @@ impl App {
         }
     }
 
-    /// Review for a single item from a context menu, with the selection rules applied.
-    fn review_single(&mut self, kind: OpKind, id: NodeId) {
+    /// Review for items from a context menu, with the selection rules applied.
+    /// Items that may not be acted on are left out, and the first reason shown.
+    fn review_items(&mut self, kind: OpKind, ids: &[NodeId]) {
         let allow_hidden = self.settings.allow_removing_hidden;
         let Some(s) = self.session() else { return };
         let tree = s.scan.tree.read();
-        let error = if tree.unscanned(id) {
-            Some(CheckError::Unscanned)
-        } else if kind == OpKind::Copy {
-            None
-        } else if !allow_hidden && tree.in_hidden(id) {
-            Some(CheckError::Hidden)
-        } else if id == tree.root() || ops::protected_reason(&tree.path(id)).is_some() {
-            Some(CheckError::System)
-        } else {
-            None
+        let refusal = |id: NodeId| {
+            if tree.unscanned(id) {
+                Some(CheckError::Unscanned)
+            } else if kind == OpKind::Copy {
+                None
+            } else if !allow_hidden && tree.in_hidden(id) {
+                Some(CheckError::Hidden)
+            } else if id == tree.root() || ops::protected_reason(&tree.path(id)).is_some() {
+                Some(CheckError::System)
+            } else {
+                None
+            }
         };
+        let mut error = None;
+        let mut ok: Vec<NodeId> = Vec::new();
+        for &id in ids {
+            match refusal(id) {
+                Some(e) => error = error.or(Some(e)),
+                None => ok.push(id),
+            }
+        }
+        // An item inside another one goes with it.
+        let set: std::collections::HashSet<NodeId> = ok.iter().copied().collect();
+        ok.retain(|&id| !tree.chain(id).iter().rev().skip(1).any(|a| set.contains(a)));
         drop(tree);
-        match error {
-            Some(e) => self.toast(Self::check_error_text(e)),
-            None => self.open_review(kind, Some(id)),
+        if let Some(e) = error {
+            self.toast(Self::check_error_text(e));
+        }
+        if !ok.is_empty() {
+            self.open_review(kind, Some(&ok));
         }
     }
 
@@ -825,22 +871,34 @@ impl App {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
-        if matches!(self.dialog, Dialog::None)
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-            && self.session().map(|s| s.search_open).unwrap_or(false)
-        {
-            self.actions.push(Action::CloseSearch);
+        // Escape first leaves a single row picked, then closes the search.
+        let (picks, search) = self.session().map(|s| (s.has_picks(), s.search_open)).unwrap_or_default();
+        if matches!(self.dialog, Dialog::None) && (picks || search) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.actions.push(if picks { Action::Unpick } else { Action::CloseSearch });
         }
         if ctx.wants_keyboard_input() {
             return;
         }
-        // Arrow keys walk the outline columns; the side buttons of a mouse go back and forward.
+        // Arrow keys walk the outline columns, with Shift they pick the rows
+        // they pass; the side buttons of a mouse go back and forward.
         let browsing = matches!(self.dialog, Dialog::None) && self.session().map(|s| s.tab == Tab::Outline && !s.search_open).unwrap_or(false);
         if browsing {
+            // egui's `consume_key` ignores an extra Shift or Alt: Alt with an
+            // arrow, going back or forward, would be taken for a plain arrow.
+            let take = |mods: Modifiers, key: Key| {
+                ctx.input_mut(|i| {
+                    let before = i.events.len();
+                    i.events.retain(|e| !matches!(e, egui::Event::Key { key: k, modifiers: m, pressed: true, .. } if *k == key && m.matches_exact(mods)));
+                    i.events.len() != before
+                })
+            };
             let steps = [(Key::ArrowUp, Step::Up), (Key::ArrowDown, Step::Down), (Key::ArrowLeft, Step::Left), (Key::ArrowRight, Step::Right)];
             for (key, step) in steps {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key)) {
+                if take(Modifiers::NONE, key) {
                     self.actions.push(Action::Step(step));
+                }
+                if matches!(step, Step::Up | Step::Down) && take(Modifiers::SHIFT, key) {
+                    self.actions.push(Action::Extend(step));
                 }
             }
         }
@@ -959,6 +1017,27 @@ impl App {
                         s.mark_dirty();
                     }
                 }
+                // Two folders picked together, next to the biggest files they hold.
+                "picked" => {
+                    if let Some(s) = self.session_mut() {
+                        s.click(Pane::Column(0), 2, Click::One);
+                        s.click(Pane::Column(0), 3, Click::Toggle);
+                    }
+                }
+                // A run of rows picked in Biggest Files, plus one more further down.
+                "biggest-picked" => {
+                    if let Some(s) = self.session_mut() {
+                        s.tab = Tab::Biggest;
+                        s.mark_dirty();
+                        s.refresh();
+                        let ids: Vec<NodeId> = s.biggest.iter().map(|r| r.id).collect();
+                        if ids.len() > 6 {
+                            s.click(Pane::Flat, ids[1], Click::One);
+                            s.click(Pane::Flat, ids[3], Click::Range);
+                            s.click(Pane::Flat, ids[6], Click::Toggle);
+                        }
+                    }
+                }
                 "search" => {
                     if let Some(s) = self.session_mut() {
                         use crate::filter::{Age, Filter, Kind};
@@ -975,6 +1054,7 @@ impl App {
                     self.hover_lock = true;
                 }
                 "settings" => self.dialog = Dialog::Settings,
+                "help" => self.dialog = Dialog::Help,
                 "update" => self.dialog = Dialog::Update(update::Stage::Available(update::sample_release())),
                 _ => {
                     if let Some(s) = self.session_mut() {
@@ -1142,13 +1222,15 @@ mod tests {
         app: App,
         ctx: egui::Context,
         time: f64,
+        /// Keys held down.
+        mods: egui::Modifiers,
     }
 
     impl Bench {
         fn new() -> Bench {
             let ctx = egui::Context::default();
             let app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Options { demo: true, ..Options::default() });
-            let mut bench = Bench { app, ctx, time: 0.0 };
+            let mut bench = Bench { app, ctx, time: 0.0, mods: egui::Modifiers::NONE };
             bench.frames(3, vec![]);
             bench
         }
@@ -1158,13 +1240,20 @@ mod tests {
             for _ in 0..count {
                 self.time += 1.0 / 60.0;
                 let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
-                let input = egui::RawInput { screen_rect: Some(screen), time: Some(self.time), events: events.take().unwrap_or_default(), ..Default::default() };
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(self.time),
+                    modifiers: self.mods,
+                    events: events.take().unwrap_or_default(),
+                    ..Default::default()
+                };
                 let (app, ctx) = (&mut self.app, self.ctx.clone());
                 let _ = ctx.run(input, |ctx| {
                     if let Some(s) = app.session_mut() {
                         s.refresh();
                     }
-                    let mut actions = Vec::new();
+                    app.handle_shortcuts(ctx);
+                    let mut actions = std::mem::take(&mut app.actions);
                     app.draw(ctx, &mut actions);
                     for action in actions {
                         app.apply(action, ctx);
@@ -1174,7 +1263,16 @@ mod tests {
         }
 
         fn button(&mut self, pos: Pos2, pressed: bool) {
-            self.frames(1, vec![Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() }]);
+            self.frames(1, vec![Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: self.mods }]);
+        }
+
+        /// A click with these keys held, right after the previous one.
+        fn click(&mut self, pos: Pos2, mods: egui::Modifiers) {
+            self.mods = mods;
+            self.frames(1, vec![Event::PointerMoved(pos)]);
+            self.button(pos, true);
+            self.button(pos, false);
+            self.mods = egui::Modifiers::NONE;
         }
 
         fn drag(&mut self, from: Pos2, by: f32) {
@@ -1205,7 +1303,7 @@ mod tests {
 
         // With two columns in sight, their common edge with the chart moves both.
         let first = bench.app.session().unwrap().columns[0].items.iter().find_map(|i| if let Item::Row(r) = i { Some(r.id) } else { None }).unwrap();
-        bench.app.apply(Action::RowClick { col: 0, id: first }, &bench.ctx.clone());
+        bench.app.apply(Action::Pick { pane: Pane::Column(0), id: first, how: Click::One }, &bench.ctx.clone());
         bench.frames(30, vec![]);
         let strip = bench.strip();
         assert_eq!(strip.width(), 608.0);
@@ -1229,5 +1327,65 @@ mod tests {
             bench.button(edge, pressed);
         }
         assert_eq!(bench.app.settings.column_width, 264.0);
+    }
+
+    #[test]
+    fn shift_and_ctrl_clicks_pick_rows() {
+        let mut bench = Bench::new();
+        let strip = bench.strip();
+        // Rows of the first column, 32 points high below a 4-point margin.
+        let row = |i: usize| pos2(strip.left() + 150.0, strip.top() + 4.0 + 32.0 * (i as f32 + 0.5));
+        let names = |bench: &Bench| -> Vec<String> {
+            let s = bench.app.session().unwrap();
+            let tree = s.scan.tree.read();
+            s.col.many.iter().map(|&id| tree.node(id).display_name()).collect()
+        };
+        bench.click(row(0), egui::Modifiers::NONE);
+        bench.click(row(2), egui::Modifiers::SHIFT);
+        assert_eq!(names(&bench), ["Projects", "Videos collection", "Movies"]);
+        // Clicks this quick are a double-click for egui; with a modifier each one counts.
+        bench.click(row(1), egui::Modifiers::COMMAND);
+        assert_eq!(names(&bench), ["Projects", "Movies"]);
+        bench.click(row(3), egui::Modifiers::ALT);
+        assert_eq!(names(&bench), ["Projects", "Movies", "Virtual Machines"]);
+        bench.frames(20, vec![]);
+        let s = bench.app.session().unwrap();
+        assert_eq!((s.columns.len(), s.merged_rows.len()), (1, 50), "the merged pane follows the first column");
+        // Ticking a checkbox with Shift ticks the rows from the box clicked before.
+        let check = |i: usize| pos2(strip.left() + 19.0, row(i).y);
+        bench.click(check(4), egui::Modifiers::NONE);
+        bench.click(check(6), egui::Modifiers::SHIFT);
+        assert_eq!(bench.app.session().unwrap().checked.len(), 3);
+        // A file clicked in the merged pane is previewed, and the columns slide to it.
+        let pane = bench.strip().left() + 264.0;
+        bench.click(pos2(pane + 150.0, strip.top() + 50.0 + 4.0 + 23.0), egui::Modifiers::NONE);
+        bench.frames(30, vec![]);
+        let first = bench.app.session().unwrap().merged_rows[0].id;
+        assert_eq!(bench.app.session().unwrap().selected_file(), Some(first));
+        let seen = crate::views::strip_scroll(&bench.ctx);
+        assert!(seen.end > 0.0 && seen.offset == seen.end, "{} of {}", seen.offset, seen.end);
+    }
+
+    #[test]
+    fn shift_with_arrow_keys_picks_rows() {
+        use egui::{Key, Modifiers};
+        let mut bench = Bench::new();
+        let press = |bench: &mut Bench, key: Key, modifiers: Modifiers| {
+            bench.frames(1, vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
+        };
+        let picked = |bench: &Bench| -> Vec<String> {
+            let s = bench.app.session().unwrap();
+            let tree = s.scan.tree.read();
+            s.col.many.iter().map(|&id| tree.node(id).display_name()).collect()
+        };
+        press(&mut bench, Key::ArrowDown, Modifiers::NONE);
+        press(&mut bench, Key::ArrowDown, Modifiers::SHIFT);
+        press(&mut bench, Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(picked(&bench), ["Projects", "Videos collection", "Movies"]);
+        // Escape leaves the row reached last alone.
+        press(&mut bench, Key::Escape, Modifiers::NONE);
+        let s = bench.app.session().unwrap();
+        assert!(!s.many());
+        assert_eq!(s.scan.tree.read().node(*s.open.last().unwrap()).display_name(), "Movies");
     }
 }

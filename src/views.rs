@@ -7,12 +7,13 @@ use crate::filter::{self, Age, Filter, Kind};
 use crate::i18n::{t, tf, tn};
 use crate::ops::OpKind;
 use crate::platform::{self, LocKind, Location};
-use crate::session::{Check, Column, GroupKind, Item, Row, Session, Tab};
+use crate::session::{Check, Click, Column, GroupKind, Item, Pane, Row, Session, Tab};
 use crate::theme::{regular, semibold};
 use crate::tree::{NodeId, F_DIR};
 use crate::widgets::{self, Btn};
 use crate::{icons, util};
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Sense, Shape, Stroke, Ui};
+use std::collections::BTreeSet;
 
 const PAD: f32 = 8.0;
 const SIDEBAR_W: f32 = 210.0;
@@ -25,6 +26,8 @@ const DISK_BAR_W: f32 = 340.0;
 const FILTER_H: f32 = 40.0;
 const ROW_H: f32 = 32.0;
 const FLAT_ROW_H: f32 = 46.0;
+/// Title lines of the pane with the biggest files of several rows.
+const MERGED_HEAD_H: f32 = 50.0;
 const COL_W: f32 = 264.0;
 const FLAT_W: f32 = 320.0;
 /// Narrowest a pane edge can be dragged to.
@@ -35,6 +38,18 @@ const SLIDE: f64 = 0.18;
 
 fn mac() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// How the row under a click was clicked: Shift picks a range, Ctrl (⌘ on
+/// macOS) or Alt adds or removes one row.
+fn click_kind(ui: &Ui) -> Click {
+    let m = ui.input(|i| i.modifiers);
+    match (m.shift, m.command || m.alt) {
+        (true, true) => Click::AddRange,
+        (true, false) => Click::Range,
+        (false, true) => Click::Toggle,
+        (false, false) => Click::One,
+    }
 }
 
 /// Where the macOS window buttons belong: left edge and vertical centre, on the toolbar line.
@@ -753,9 +768,10 @@ impl App {
         } else {
             // As many columns as fit while the chart keeps a fair share; the others scroll sideways.
             let room = if self.settings.show_chart { rect.width() - chart_min.max(rect.width() * 0.42) } else { rect.width() };
-            // A selected file gets one more pane, with its preview.
+            // Rows picked together get one more pane with their biggest
+            // files, and a selected file one with its preview.
             let file = s.selected_file();
-            let panes = s.columns.len() + file.is_some() as usize;
+            let panes = s.columns.len() + s.many() as usize + file.is_some() as usize;
             let shown = ((room / COL_W).floor() as usize).clamp(1, panes.max(1));
             // The count follows the standard width, so that dragging an edge never changes it.
             (min, max, default) = (MIN_COL_W, ((rect.width() - chart_min) / shown as f32).max(MIN_COL_W), COL_W);
@@ -819,7 +835,8 @@ impl App {
     /// The outline: one column per opened folder, sliding to the last one after each move.
     /// Returns how far the columns are scrolled sideways.
     fn columns(&self, ui: &mut Ui, strip: Rect, col_w: f32, file: Option<NodeId>, s: &Session, acts: &mut Vec<Action>) -> f32 {
-        let total = (s.columns.len() + file.is_some() as usize) as f32 * col_w;
+        let merged = s.many() as usize;
+        let total = (s.columns.len() + merged + file.is_some() as usize) as f32 * col_w;
         let end = (total - strip.width()).max(0.0);
         let id = ui.id().with("columns");
         let now = ui.input(|i| i.time);
@@ -865,8 +882,12 @@ impl App {
                     self.column(ui, pane(ci), ci, col, s, ci >= fresh, acts);
                 }
             }
-            if let Some(id) = file.filter(|_| pane(s.columns.len()).intersects(ui.clip_rect())) {
-                self.preview(ui, pane(s.columns.len()), id, acts);
+            if merged > 0 && pane(s.columns.len()).intersects(ui.clip_rect()) {
+                self.merged_pane(ui, pane(s.columns.len()), s, acts);
+            }
+            let last = s.columns.len() + merged;
+            if let Some(id) = file.filter(|_| pane(last).intersects(ui.clip_rect())) {
+                self.preview(ui, pane(last), id, acts);
             }
         });
         state.offset = out.state.offset.x;
@@ -980,8 +1001,8 @@ impl App {
                 for item in &col.items[range] {
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
                     match item {
-                        Item::Row(row) => self.row(ui, r, resp, row, Some(ci), selected == Some(row.id), false, s, acts),
-                        Item::Member(row) => self.row(ui, r, resp, row, Some(ci), selected == Some(row.id), true, s, acts),
+                        Item::Row(row) => self.row(ui, r, resp, row, ci, false, s, acts),
+                        Item::Member(row) => self.row(ui, r, resp, row, ci, true, s, acts),
                         Item::Group { kind, size, count, open } => {
                             if resp.hovered() {
                                 ui.painter().rect_filled(r.shrink2(vec2(4.0, 1.0)), CornerRadius::same(6), pal.row_hover);
@@ -1021,11 +1042,12 @@ impl App {
 
     /// One file or folder line of an outline column.
     #[allow(clippy::too_many_arguments)]
-    fn row(&self, ui: &mut Ui, r: Rect, resp: egui::Response, row: &Row, col: Option<usize>, selected: bool, member: bool, s: &Session, acts: &mut Vec<Action>) {
+    fn row(&self, ui: &mut Ui, r: Rect, resp: egui::Response, row: &Row, ci: usize, member: bool, s: &Session, acts: &mut Vec<Action>) {
         let pal = &self.pal;
+        let pane = Pane::Column(ci);
         let hovered = resp.hovered() || s.hover == Some(row.id);
         let bg = r.shrink2(vec2(4.0, 1.0));
-        if selected {
+        if s.is_picked(pane, row.id) {
             ui.painter().rect_filled(bg, CornerRadius::same(6), pal.row_selected);
         } else if hovered {
             ui.painter().rect_filled(bg, CornerRadius::same(6), pal.row_hover);
@@ -1037,7 +1059,7 @@ impl App {
         widgets::checkbox(ui.painter(), cb, row.check, pal, can_check);
         let cb_resp = ui.interact(cb.expand(6.0), resp.id.with("check"), Sense::click());
         if cb_resp.clicked() {
-            acts.push(Action::ToggleCheck(row.id));
+            acts.push(Action::Tick { pane, id: row.id, range: ui.input(|i| i.modifiers.shift) });
         }
         let icon = Rect::from_center_size(pos2(r.left() + 46.0 + indent, r.center().y), vec2(20.0, 20.0));
         widgets::item_icon(ui.painter(), icon, row.flags, pal, dim);
@@ -1051,26 +1073,36 @@ impl App {
         let truncated = name != row.name;
         let ink = if dim { pal.text_faint } else { pal.text };
         ui.painter().text(pos2(name_x, r.center().y), Align2::LEFT_CENTER, name, regular(13.5), ink);
-        if let Some(c) = col {
-            crate::record::mark(ui.ctx(), || format!("row:{c}:{}", row.name), pos2(name_x + 40.0, r.center().y));
-        }
+        crate::record::mark(ui.ctx(), || format!("row:{ci}:{}", row.name), pos2(name_x + 40.0, r.center().y));
 
         if resp.hovered() || cb_resp.hovered() {
             acts.push(Action::Hover(row.id, false));
         }
         // A double-click opens a file. On a folder its second click is dropped:
-        // it may land on a column that just slid in.
-        if resp.double_clicked() && row.flags & F_DIR == 0 {
+        // it may land on a column that just slid in. With a modifier every
+        // click counts, however quick: egui takes two clicks on different
+        // rows for a double-click.
+        let how = click_kind(ui);
+        if how != Click::One {
+            if resp.clicked() {
+                acts.push(Action::Pick { pane, id: row.id, how });
+            }
+        } else if resp.double_clicked() && row.flags & F_DIR == 0 {
             acts.push(Action::Open(row.id));
         } else if resp.clicked() && !resp.double_clicked() {
-            match col {
-                Some(c) => acts.push(Action::RowClick { col: c, id: row.id }),
-                None => acts.push(Action::FlatClick(row.id)),
-            }
+            acts.push(Action::Pick { pane, id: row.id, how });
         }
-        resp.context_menu(|ui| self.item_menu(ui, row.id, row.flags, row.check, acts));
+        resp.context_menu(|ui| self.row_menu(ui, pane, row, s, acts));
         if truncated {
             resp.on_hover_text(&row.name);
+        }
+    }
+
+    /// The context menu of a row: for it alone, or for all the rows picked with it.
+    fn row_menu(&self, ui: &mut Ui, pane: Pane, row: &Row, s: &Session, acts: &mut Vec<Action>) {
+        match s.picked_with(pane, row.id) {
+            Some(picked) => self.picks_menu(ui, picked, s, acts),
+            None => self.item_menu(ui, row.id, row.flags, row.check, acts),
         }
     }
 
@@ -1087,7 +1119,7 @@ impl App {
         ui.separator();
         entry(ui, t("Copy Path"), Action::On(Cmd::CopyPath, id));
         ui.separator();
-        entry(ui, if check == Check::Yes { t("Deselect") } else { t("Select") }, Action::ToggleCheck(id));
+        entry(ui, if check == Check::Yes { t("Untick") } else { t("Tick") }, Action::ToggleCheck(id));
         ui.separator();
         entry(ui, t("Quick Remove"), Action::QuickRemove(id));
         entry(ui, t("Move to Folder…"), Action::On(Cmd::Move, id));
@@ -1099,52 +1131,107 @@ impl App {
         }
     }
 
+    /// The context menu of several picked rows: every entry acts on all of them.
+    fn picks_menu(&self, ui: &mut Ui, picked: &BTreeSet<NodeId>, s: &Session, acts: &mut Vec<Action>) {
+        let ids: Vec<NodeId> = picked.iter().copied().collect();
+        ui.label(egui::RichText::new(tf("{} items", &[&util::fmt_count(ids.len() as u64)])).color(self.pal.text_dim));
+        ui.separator();
+        let mut entry = |ui: &mut Ui, label: &str, action: Action| {
+            if ui.button(label).clicked() {
+                acts.push(action);
+                ui.close_menu();
+            }
+        };
+        if ids.iter().any(|id| !s.checked.contains(id)) {
+            entry(ui, t("Tick"), Action::SetChecks(ids.clone(), true));
+        }
+        if ids.iter().any(|id| s.checked.contains(id)) {
+            entry(ui, t("Untick"), Action::SetChecks(ids.clone(), false));
+        }
+        ui.separator();
+        entry(ui, t("Quick Remove"), Action::OnMany(Cmd::Remove, ids.clone()));
+        entry(ui, t("Move to Folder…"), Action::OnMany(Cmd::Move, ids.clone()));
+        entry(ui, t("Copy to Folder…"), Action::OnMany(Cmd::Copy, ids.clone()));
+        ui.separator();
+        entry(ui, t("Copy Paths"), Action::OnMany(Cmd::CopyPath, ids));
+    }
+
     /// Biggest files or search results: two-line rows with the parent path.
     fn flat_list(&self, ui: &mut Ui, rect: Rect, s: &Session, acts: &mut Vec<Action>) {
-        let pal = &self.pal;
         let searching = s.search_open;
-        let rows: &[Row] = if searching { &s.search_rows } else { &s.biggest };
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(0.0, 4.0))).id_salt("flat-list"));
+        let empty = if !searching {
+            if s.scan.is_done() { t("No files found") } else { t("Scanning…") }
+        } else if !s.has_search() {
+            t("Type a name or choose a filter to search the scanned items")
+        } else if s.searching {
+            t("Searching…")
+        } else {
+            t("No items match your search")
+        };
+        let more = (!searching && s.biggest_more).then_some(Action::MoreBiggest);
+        self.rows_list(ui, rect, Pane::Flat, s.flat_rows(), more, empty, s, acts);
+    }
+
+    /// The pane after a column where several rows are picked: the biggest files they hold.
+    fn merged_pane(&self, ui: &mut Ui, rect: Rect, s: &Session, acts: &mut Vec<Action>) {
+        let pal = &self.pal;
+        ui.painter().line_segment([rect.left_top(), rect.left_bottom()], Stroke::new(1.0_f32, pal.panel_line.gamma_multiply(0.6)));
+        // Title, then how many rows are picked and their total size.
+        let head = Rect::from_min_size(rect.min, vec2(rect.width(), MERGED_HEAD_H));
+        let count = tf("{} items", &[&util::fmt_count(s.col.many.len() as u64)]);
+        let what = format!("{count} · {}", util::fmt_size(s.picked_size));
+        let room = head.width() - 28.0;
+        let p = ui.painter();
+        let title = widgets::fit_end(ui, t("Biggest Files"), &semibold(13.0), room);
+        p.text(pos2(head.left() + 14.0, head.top() + 17.0), Align2::LEFT_CENTER, title, semibold(13.0), pal.text);
+        let what = widgets::fit_end(ui, &what, &regular(12.0), room);
+        p.text(pos2(head.left() + 14.0, head.top() + 34.0), Align2::LEFT_CENTER, what, regular(12.0), pal.text_dim);
+        p.line_segment([pos2(head.left() + 10.0, head.bottom()), pos2(head.right() - 10.0, head.bottom())], Stroke::new(1.0_f32, pal.panel_line.gamma_multiply(0.5)));
+        let empty = if s.scan.is_done() { t("No files found") } else { t("Scanning…") };
+        let list = Rect::from_min_max(pos2(rect.left(), head.bottom()), rect.max);
+        let more = s.merged_more.then_some(Action::MoreMerged);
+        self.rows_list(ui, list, Pane::Merged, &s.merged_rows, more, empty, s, acts);
+    }
+
+    /// Two-line rows saying where each item is, with a button for more at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn rows_list(&self, ui: &mut Ui, rect: Rect, pane: Pane, rows: &[Row], more: Option<Action>, empty: &str, s: &Session, acts: &mut Vec<Action>) {
+        let pal = &self.pal;
+        let key = if pane == Pane::Merged { "merged" } else { "flat" };
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(0.0, 4.0))).id_salt((key, "list")));
         child.spacing_mut().item_spacing = vec2(0.0, 0.0);
         if rows.is_empty() {
-            let text = if !searching {
-                if s.scan.is_done() { t("No files found") } else { t("Scanning…") }
-            } else if !s.has_search() {
-                t("Type a name or choose a filter to search the scanned items")
-            } else if s.searching {
-                t("Searching…")
-            } else {
-                t("No items match your search")
-            };
-            let text = widgets::fit_end(ui, text, &regular(13.0), rect.width() - 20.0);
+            let text = widgets::fit_end(ui, empty, &regular(13.0), rect.width() - 20.0);
             child.painter().text(pos2(rect.center().x, rect.top() + 44.0), Align2::CENTER_CENTER, text, regular(13.0), pal.text_faint);
             return;
         }
-        let more = !searching && s.biggest_more;
-        egui::ScrollArea::vertical().id_salt(("flat-scroll", searching)).auto_shrink([false, false]).show_rows(
+        // The merged pane starts from the top again when other rows are picked.
+        let salt = egui::Id::new((key, "scroll", s.search_open)).with((pane == Pane::Merged).then_some(&s.col.many));
+        egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show_rows(
             &mut child,
             FLAT_ROW_H,
-            rows.len() + more as usize,
+            rows.len() + more.is_some() as usize,
             |ui, range| {
                 for i in range {
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), FLAT_ROW_H), Sense::click());
                     let Some(row) = rows.get(i) else {
                         let b = Rect::from_center_size(r.center(), vec2((r.width() - 60.0).min(240.0), 32.0));
                         if widgets::button(ui, b, t("View more biggest files"), Btn::Outline, true, pal, regular(13.0)).clicked() {
-                            acts.push(Action::MoreBiggest);
+                            acts.extend(more.clone());
                         }
                         continue;
                     };
-                    self.flat_row(ui, r, resp, row, s, acts);
+                    self.flat_row(ui, r, resp, pane, row, s, acts);
                 }
             },
         );
     }
 
-    fn flat_row(&self, ui: &mut Ui, r: Rect, resp: egui::Response, row: &Row, s: &Session, acts: &mut Vec<Action>) {
+    #[allow(clippy::too_many_arguments)]
+    fn flat_row(&self, ui: &mut Ui, r: Rect, resp: egui::Response, pane: Pane, row: &Row, s: &Session, acts: &mut Vec<Action>) {
         let pal = &self.pal;
         let bg = r.shrink2(vec2(4.0, 1.0));
-        if s.focus == Some(row.id) {
+        if s.is_picked(pane, row.id) {
             ui.painter().rect_filled(bg, CornerRadius::same(6), pal.row_selected);
         } else if resp.hovered() || s.hover == Some(row.id) {
             ui.painter().rect_filled(bg, CornerRadius::same(6), pal.row_hover);
@@ -1154,15 +1241,17 @@ impl App {
         widgets::checkbox(ui.painter(), cb, row.check, pal, !row.hidden || self.settings.allow_removing_hidden);
         let cb_resp = ui.interact(cb.expand(6.0), resp.id.with("check"), Sense::click());
         if cb_resp.clicked() {
-            acts.push(Action::ToggleCheck(row.id));
+            acts.push(Action::Tick { pane, id: row.id, range: ui.input(|i| i.modifiers.shift) });
         }
-        let icon = Rect::from_center_size(pos2(r.left() + 50.0, r.center().y), vec2(26.0, 26.0));
+        // The merged pane is as narrow as a column: a smaller icon leaves the name more room.
+        let (icon_x, icon_side, x) = if pane == Pane::Merged { (46.0, 20.0, 64.0) } else { (50.0, 26.0, 74.0) };
+        let icon = Rect::from_center_size(pos2(r.left() + icon_x, r.center().y), vec2(icon_side, icon_side));
         widgets::item_icon(ui.painter(), icon, row.flags, pal, dim);
         let size = util::fmt_size(row.size);
         let size_w = widgets::text_width(ui, &size, &regular(13.5));
         let size_color = if dim { pal.text_faint } else { pal.size[util::size_class(row.size) as usize] };
         ui.painter().text(pos2(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, size, regular(13.5), size_color);
-        let x = r.left() + 74.0;
+        let x = r.left() + x;
         let text_w = r.right() - 14.0 - size_w - 10.0 - x;
         let name = widgets::fit_middle(ui, &row.name, &regular(13.5), text_w);
         ui.painter().text(pos2(x, r.center().y - 9.0), Align2::LEFT_CENTER, name, regular(13.5), if dim { pal.text_dim } else { pal.text });
@@ -1172,17 +1261,26 @@ impl App {
         if resp.hovered() || cb_resp.hovered() {
             acts.push(Action::Hover(row.id, false));
         }
-        if resp.double_clicked() {
+        // With a modifier every click counts, as in the columns.
+        let how = click_kind(ui);
+        if how != Click::One {
+            if resp.clicked() {
+                acts.push(Action::Pick { pane, id: row.id, how });
+            }
+        } else if resp.double_clicked() {
             acts.push(if row.flags & F_DIR == 0 { Action::Open(row.id) } else { Action::SelectPath(row.id) });
         } else if resp.clicked() {
-            acts.push(Action::FlatClick(row.id));
+            acts.push(Action::Pick { pane, id: row.id, how });
         }
-        resp.context_menu(|ui| {
-            self.item_menu(ui, row.id, row.flags, row.check, acts);
-            ui.separator();
-            if ui.button(t("Show in Folders Outline")).clicked() {
-                acts.push(Action::SelectPath(row.id));
-                ui.close_menu();
+        resp.context_menu(|ui| match s.picked_with(pane, row.id) {
+            Some(picked) => self.picks_menu(ui, picked, s, acts),
+            None => {
+                self.item_menu(ui, row.id, row.flags, row.check, acts);
+                ui.separator();
+                if ui.button(t("Show in Folders Outline")).clicked() {
+                    acts.push(Action::SelectPath(row.id));
+                    ui.close_menu();
+                }
             }
         });
         resp.on_hover_text(format!("{}\n{}", row.name, row.crumbs.join(" › ")));
@@ -1213,10 +1311,9 @@ impl App {
         let hit = resp.hover_pos().map(|pos| chart::hit(l, &g, pos)).unwrap_or(Hit::None);
         let find = |id: NodeId| l.segs.iter().position(|x| x.kind == SegKind::Node && x.id == id);
 
-        // The item selected in the lists keeps a thin outline.
-        let marked = if s.search_open || s.tab == Tab::Biggest { s.focus } else { s.open.last().copied() };
-        if let Some(i) = marked.and_then(find) {
-            p.add(Shape::closed_line(chart::outline(&g, &l.segs[i]), Stroke::new(1.5_f32, Color32::from_white_alpha(200))));
+        // The items selected in the lists keep a thin outline.
+        for seg in l.segs.iter().filter(|seg| seg.kind == SegKind::Node && s.is_marked(seg.id)) {
+            p.add(Shape::closed_line(chart::outline(&g, seg), Stroke::new(1.5_f32, Color32::from_white_alpha(200))));
         }
 
         let mut highlight = match hit {
@@ -1319,9 +1416,12 @@ impl App {
         let font = regular(12.5);
         let file = s.selected_file();
         let widths: Vec<f32> = s.crumbs.iter().map(|c| widgets::text_width(ui, &c.1, &font).min(220.0) + 22.0).collect();
+        // Rows picked together end the path with their number.
+        let tail = s.many().then(|| tf("{} items", &[&util::fmt_count(s.col.many.len() as u64)]));
+        let tail_w = tail.as_ref().map_or(0.0, |t| widgets::text_width(ui, t, &font) + 16.0);
         // Drop leading folders when the path does not fit.
         let mut first = 0;
-        let mut total: f32 = widths.iter().sum::<f32>() + 16.0 * widths.len() as f32;
+        let mut total: f32 = widths.iter().sum::<f32>() + 16.0 * widths.len() as f32 + tail_w;
         while total > rect.width() - 40.0 && first + 1 < widths.len() {
             total -= widths[first] + 16.0;
             first += 1;
@@ -1351,10 +1451,13 @@ impl App {
                 acts.push(Action::Crumb(*id));
             }
             x += w + 4.0;
-            if i + 1 < s.crumbs.len() {
+            if i + 1 < s.crumbs.len() || tail.is_some() {
                 ui.painter().text(pos2(x + 2.0, cy), Align2::LEFT_CENTER, "›", font.clone(), pal.text_faint);
                 x += 12.0;
             }
+        }
+        if let Some(tail) = tail {
+            ui.painter().text(pos2(x + 3.0, cy), Align2::LEFT_CENTER, tail, font, pal.text_dim);
         }
     }
 

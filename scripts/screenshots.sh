@@ -34,6 +34,8 @@ echo "Screenshots:"
 shot overview overview.png light
 shot columns columns.png light
 shot biggest biggest-files.png light
+shot picked several-folders.png light
+shot biggest-picked several-files.png light
 shot review review.png light
 shot overview dark.png dark
 shot idle start.png light
