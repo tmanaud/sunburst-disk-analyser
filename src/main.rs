@@ -112,6 +112,11 @@ fn main() -> eframe::Result<()> {
         // Content runs under a transparent title bar, as in native macOS utilities.
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
+    if opts.shot.is_some() || opts.record.is_some() {
+        if let Some(at) = record::retina_screen() {
+            viewport = viewport.with_position(at);
+        }
+    }
     let options = eframe::NativeOptions { viewport, multisampling: 4, ..Default::default() };
     eframe::run_native(
         "Sunburst Disk Analyser",

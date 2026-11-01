@@ -287,6 +287,15 @@ impl App {
         self.volumes.iter().find(|v| v.0.path == path).map(|v| v.1)
     }
 
+    /// Capacity of the volume holding `path`: the one with the deepest mount point above it.
+    pub fn space_holding(&self, path: &Path) -> Option<Space> {
+        self.volumes
+            .iter()
+            .filter(|v| path.starts_with(&v.0.path))
+            .max_by_key(|v| v.0.path.components().count())
+            .map(|v| v.1)
+    }
+
     fn known_location(&self, path: &Path) -> Option<Location> {
         self.home
             .iter()

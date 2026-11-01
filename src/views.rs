@@ -19,6 +19,8 @@ const SIDEBAR_W: f32 = 210.0;
 const TOPBAR_H: f32 = 56.0;
 const FOOTER_H: f32 = 74.0;
 const CRUMB_H: f32 = 30.0;
+/// Widest the volume bar in the toolbar gets.
+const DISK_BAR_W: f32 = 340.0;
 /// Row of search filters under the toolbar.
 const FILTER_H: f32 = 40.0;
 const ROW_H: f32 = 32.0;
@@ -417,17 +419,29 @@ impl App {
             x = seg.right() + 16.0;
         }
 
-        // Title: name and size of the scanned location, centred in the space left.
+        // Title: name and size of the scanned location, centred in the space left,
+        // drawn over a bar of its volume when one holds it and there is room.
         let space = right - x - 8.0;
         if space < 60.0 {
             return;
         }
         let scanning = !s.scan.is_done();
+        let spin_w = if scanning { 24.0 } else { 0.0 };
+        let disk = self.current.as_ref().and_then(|l| self.space_holding(&l.path)).filter(|d| d.total > 0);
+        if let Some(d) = disk {
+            let area = Rect::from_min_max(pos2(x + spin_w, cy - 12.0), pos2(right - 8.0, cy + 12.0));
+            if let Some(bar) = self.disk_bar(ui, area, s, d) {
+                if scanning {
+                    widgets::spinner(ui.painter(), pos2(bar.left() - 17.0, cy), 6.5, pal.text_dim, ui.input(|i| i.time));
+                }
+                return;
+            }
+        }
         let size = format!("{} {}", t("Size:"), util::fmt_size(s.total_size));
         let size_w = widgets::text_width(ui, &size, &regular(14.0));
         let name = widgets::fit_middle(ui, &s.name, &regular(14.0), (space - size_w - 40.0).max(30.0));
         let name_w = widgets::text_width(ui, &name, &regular(14.0));
-        let total = name_w + 12.0 + size_w + if scanning { 24.0 } else { 0.0 };
+        let total = name_w + 12.0 + size_w + spin_w;
         let mut tx = (x + (space - total) * 0.5).max(x);
         if scanning {
             widgets::spinner(ui.painter(), pos2(tx + 7.0, cy), 6.5, pal.text_dim, ui.input(|i| i.time));
@@ -437,6 +451,114 @@ impl App {
         if space >= total {
             ui.painter().text(pos2(tx + name_w + 12.0, cy), Align2::LEFT_CENTER, size, regular(14.0), pal.text_dim);
         }
+    }
+
+    /// The volume as one bar, each part carrying its own size: the scanned
+    /// location, the rest of the used space, and the free space at the end.
+    /// Checked items are hatched out of the location's part, and the free
+    /// space shows what it would become once they are gone. Centred in
+    /// `area`; returns the bar, or `None` when there is no room for it.
+    fn disk_bar(&self, ui: &Ui, area: Rect, s: &Session, d: platform::Space) -> Option<Rect> {
+        let pal = &self.pal;
+        let p = ui.painter();
+        let used = d.total - d.free.min(d.total);
+        let folder = s.total_size.min(used);
+        let gain = s.checked_size.min(folder);
+        let after = d.free.min(d.total) + gain;
+
+        // Each label goes inside its part, or beside the bar when the part is
+        // too small for it: the location's before, the free space's after.
+        let font = semibold(12.5);
+        let size = util::fmt_size(s.total_size);
+        let tail = format!(" · {size}");
+        let tail_w = widgets::text_width(ui, &tail, &font);
+        let free = util::fmt_size(after);
+        let free_font = if gain > 0 { font.clone() } else { regular(12.5) };
+        let free_w = widgets::text_width(ui, &free, &free_font);
+        let share = |b: u64| b as f32 / d.total as f32;
+        let mut w = (area.width() - 8.0).min(DISK_BAR_W);
+        let free_out = w * share(d.free) < free_w + 14.0;
+        let name_out = w * share(folder - gain) < tail_w + 50.0;
+        let outer = |label: f32, out: bool| if out { label + 8.0 } else { 0.0 };
+        let name_w = if name_out { widgets::text_width(ui, &s.name, &regular(13.0)).min(120.0) + widgets::text_width(ui, &tail, &regular(13.0)) } else { 0.0 };
+        w = w.min(area.width() - 8.0 - outer(free_w, free_out) - outer(name_w, name_out));
+        if w < 150.0 {
+            return None;
+        }
+        let group = w + outer(free_w, free_out) + outer(name_w, name_out);
+        let left = area.left() + (area.width() - group) * 0.5 + outer(name_w, name_out);
+        let r = Rect::from_min_size(pos2(left, area.top()), vec2(w, area.height()));
+        let at = |b: u64| r.left() + (r.width() as f64 * b as f64 / d.total as f64) as f32;
+        let (x_keep, x_folder, x_used) = (at(folder - gain), at(folder), at(used));
+
+        // Each part is painted from the left edge, widest first, so that the
+        // track's rounded ends clip them all.
+        let rad = (r.height() * 0.5) as u8;
+        let part = |to: f32, fill: Color32| {
+            let corners = if to > r.right() - r.height() * 0.5 { CornerRadius::same(rad) } else { CornerRadius { nw: rad, sw: rad, ne: 0, se: 0 } };
+            p.rect_filled(Rect::from_min_max(r.min, pos2(to, r.bottom())), corners, fill);
+        };
+        p.rect_filled(r, CornerRadius::same(rad), pal.control);
+        part(x_used, pal.seg_other);
+        if gain > 0 {
+            part(x_folder, pal.seg_checked);
+            let hatch = p.with_clip_rect(Rect::from_x_y_ranges(x_keep..=x_folder, r.y_range()));
+            let mut hx = x_keep - r.height();
+            while hx < x_folder {
+                hatch.line_segment([pos2(hx, r.bottom()), pos2(hx + r.height(), r.top())], Stroke::new(2.5_f32, Color32::from_white_alpha(120)));
+                hx += 7.0;
+            }
+        }
+        part(x_keep, pal.accent);
+        p.rect_stroke(r, CornerRadius::same(rad), Stroke::new(1.0_f32, pal.control_line), egui::StrokeKind::Inside);
+
+        // Labels, each inside its part when it fits.
+        let green = Color32::from_rgb(31, 138, 92);
+        let room = x_keep - r.left() - 20.0;
+        if name_out {
+            let name = widgets::fit_middle(ui, &s.name, &regular(13.0), 120.0);
+            p.text(pos2(r.left() - 8.0, r.center().y), Align2::RIGHT_CENTER, format!("{name}{tail}"), regular(13.0), pal.text_dim);
+        } else {
+            let name = widgets::fit_middle(ui, &s.name, &font, room - tail_w);
+            p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, format!("{name}{tail}"), font.clone(), Color32::WHITE);
+        }
+        if gain > 0 {
+            let label = format!("−{}", util::fmt_size(gain));
+            if widgets::text_width(ui, &label, &font) + 8.0 <= x_folder - x_keep {
+                p.text(pos2((x_keep + x_folder) * 0.5, r.center().y), Align2::CENTER_CENTER, label, font.clone(), green);
+            }
+        }
+        let ink = if gain > 0 {
+            if pal.dark { Color32::from_rgb(120, 220, 170) } else { green }
+        } else if d.free < d.total / 10 {
+            pal.danger
+        } else {
+            pal.text_dim
+        };
+        if free_out {
+            p.text(pos2(r.right() + 8.0, r.center().y), Align2::LEFT_CENTER, free, free_font, ink);
+        } else {
+            p.text(pos2(r.right() - 7.0, r.center().y), Align2::RIGHT_CENTER, free, free_font, ink);
+        }
+
+        let mut tip = format!(
+            "{}  {}\n\n{} {}\n{} {}\n{} {}",
+            s.name,
+            size,
+            t("Capacity:"),
+            util::fmt_size(d.total),
+            t("Used:"),
+            util::fmt_size(used),
+            t("Available:"),
+            util::fmt_size(d.free)
+        );
+        if gain > 0 {
+            let gain = tf("{} free after removing the selected items", &[&util::fmt_size(after)]);
+            tip = format!("{tip}\n\n{gain}\n{}", t("Empty the Trash to free up the space."));
+        }
+        let hover = Rect::from_x_y_ranges(r.left() - outer(name_w, name_out)..=r.right() + outer(free_w, free_out), r.y_range());
+        ui.interact(hover, ui.id().with("disk-space"), Sense::hover()).on_hover_text(tip);
+        Some(r)
     }
 
     // ---- start screen ------------------------------------------------------------

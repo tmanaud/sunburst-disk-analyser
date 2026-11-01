@@ -367,13 +367,60 @@ fn mix(img: &mut RgbaImage, base: &RgbaImage, a: f32) {
     }
 }
 
+/// Top-left corner, in points, of a 2x screen to open the rendering window
+/// on, so that the pictures do not depend on where the pointer is. The
+/// built-in screen of a MacBook is one, whatever display is the main one.
+#[cfg(target_os = "macos")]
+pub fn retina_screen() -> Option<[f32; 2]> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct CGRect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+        fn CGDisplayBounds(display: u32) -> CGRect;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
+        fn CGDisplayModeGetWidth(mode: *mut c_void) -> usize;
+        fn CGDisplayModeGetPixelWidth(mode: *mut c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *mut c_void);
+    }
+    let mut ids = [0u32; 16];
+    let mut count = 0u32;
+    // SAFETY: the list is written within its 16 entries; each mode copied is released.
+    unsafe {
+        if CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) != 0 {
+            return None;
+        }
+        ids[..count as usize].iter().find_map(|&id| {
+            let mode = CGDisplayCopyDisplayMode(id);
+            if mode.is_null() {
+                return None;
+            }
+            let (points, pixels) = (CGDisplayModeGetWidth(mode), CGDisplayModeGetPixelWidth(mode));
+            CGDisplayModeRelease(mode);
+            let b = CGDisplayBounds(id);
+            (points > 0 && pixels as f32 / points as f32 == SCALE).then_some([b.x as f32 + 40.0, b.y as f32 + 60.0])
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn retina_screen() -> Option<[f32; 2]> {
+    None
+}
+
 /// Stops a rendering made on a screen that is not 2x: the pictures would be
 /// blurred and laid out differently from one run to the next.
 pub fn check_scale(ppp: f32) {
     if (ppp - SCALE).abs() > 0.01 {
         eprintln!(
             "The README pictures need a Retina (2x) screen, but the window opened on a {ppp}x one. \
-             Put the pointer on a Retina screen, or make it the main display, and run again."
+             Open the lid of the MacBook (its built-in screen is used automatically) or connect a Retina display, and run again."
         );
         std::process::exit(1);
     }
