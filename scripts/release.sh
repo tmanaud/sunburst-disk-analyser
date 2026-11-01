@@ -14,6 +14,8 @@ version="${1:-}"
 tag="v$version"
 
 [[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || die "switch to main first"
+# The release notes are taken from this section by the release workflow.
+grep -Eq "^## ${version//./\\.}( |$)" CHANGELOG.md || die "CHANGELOG.md has no \"## $version\" section: write it and commit it first"
 [[ -z "$(git status --porcelain)" ]] || die "commit or stash your changes first"
 git fetch --quiet origin main --tags
 [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main is not the same as origin/main"
