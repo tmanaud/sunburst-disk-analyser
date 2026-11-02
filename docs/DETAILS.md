@@ -31,7 +31,7 @@ Quick Look is macOS only; other systems open the file with its default app, exce
 
 ## File operations
 
-- Linux: removal moves the item into its own volume's Trash (your home Trash or `.Trash-<uid>`), or is refused. Windows: removal is refused on drives without a Recycle Bin, such as network shares and removable drives.
+- Linux: removal moves the item into its own volume's Trash (your home Trash or `.Trash-<uid>`), or is refused. macOS refuses on volumes without a Trash. Windows refuses on drives without a Recycle Bin, such as network shares and removable drives, and when the Recycle Bin is turned off or too small for the item.
 - Volume roots, the home folder, its standard folders and system folders cannot be selected. Hidden items need permission in Settings. Mounted volumes and unreadable folders cannot be selected.
 - Right before acting, each item is compared with what you reviewed: the same file with the same size and date, or the same folder (on Windows, the same path). Changed or missing items are skipped and reported; scan again to act on them.
 - A folder goes with everything it holds at that moment, including files added since the scan.
@@ -50,6 +50,10 @@ The Windows and Linux builds have had less hands-on testing than the macOS build
 The check asks `api.github.com` for the latest release. GitHub sees your IP address and the app version; nothing about your disks or files is sent. **Check for Updates…** is in the app menu on macOS, in the Help menu elsewhere.
 
 When a newer version exists, you can download it, open its release page or skip it. The download goes to your Downloads folder and is checked against the release's SHA-256 checksums. The app never replaces itself: quit it and swap in the new version. On macOS the new copy may need Full Disk Access again.
+
+## Crashes
+
+If the app quits unexpectedly, it leaves `crash.log` in its settings folder: `~/Library/Application Support/sunburst-disk-analyser` on macOS, `%APPDATA%\sunburst-disk-analyser` on Windows, `~/.config/sunburst-disk-analyser` on Linux. Please attach it to an [issue](https://github.com/tmanaud/sunburst-disk-analyser/issues).
 
 ## Linux and command line
 

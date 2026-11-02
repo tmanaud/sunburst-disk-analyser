@@ -15,7 +15,7 @@ Animation and screenshots use demo data. The animated scan is sped up.
 
 | System | Download 1.1.0 | First launch |
 | --- | --- | --- |
-| macOS 11+ · Intel / Apple Silicon | [DMG](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.0/Sunburst-Disk-Analyser-1.1.0-macos-universal.dmg) | Drag the app to Applications. Not notarised: right-click → **Open**, or allow it in System Settings → Privacy & Security. |
+| macOS 11+ · Intel / Apple Silicon | [DMG](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.0/Sunburst-Disk-Analyser-1.1.0-macos-universal.dmg) | Drag the app to Applications. Not notarised: open it once, then click **Open Anyway** in System Settings → Privacy & Security. |
 | Windows 10/11 · x64 | [ZIP](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.0/Sunburst-Disk-Analyser-1.1.0-windows-x64.zip) | Unzip and run **Sunburst Disk Analyser.exe**. SmartScreen: **More info → Run anyway**. |
 | Linux · x86_64 | [AppImage](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.0/Sunburst-Disk-Analyser-1.1.0-linux-x86_64.AppImage) | `chmod +x` the AppImage, then run it. Needs glibc 2.35+ and OpenGL. |
 
@@ -62,6 +62,8 @@ cargo run --release
 ## Credits
 
 Rust and [egui](https://github.com/emilk/egui). [Inter](https://rsms.me/inter/) font: SIL Open Font License.
+
+Fully written with AI coding assistants (Claude, with reviews by GPT), directed and tested by the author.
 
 Film picture: resized frame of [Big Buck Bunny](https://peach.blender.org/), © 2008 Blender Foundation, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
 

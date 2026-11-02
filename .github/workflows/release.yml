@@ -64,6 +64,40 @@ jobs:
           name: windows
           path: dist/*.zip
           if-no-files-found: error
+      # Removal reaches the Recycle Bin, or leaves the item in place. Temp
+      # files live on C:, whose bin the next steps shrink, then turn off.
+      - name: Removal goes to the Recycle Bin
+        timeout-minutes: 10
+        run: cargo test -- --ignored --exact ops::tests::remove_goes_to_trash ops::tests::removed_item_is_in_recycle_bin
+      - name: Removal refused when the Recycle Bin is too small
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $volume = (Get-CimInstance Win32_Volume -Filter "DriveLetter='C:'").DeviceID
+          $guid = [regex]::Match($volume, '\{[^}]+\}').Value
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\$guid"
+          New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name MaxCapacity -Value 1 -Type DWord
+          $env:REFUSED_SIZE = 4194304
+          cargo test -- --ignored --exact ops::tests::remove_refused_when_recycle_bin_cannot_take_it
+      - name: Removal refused when the Recycle Bin is off
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoRecycleFiles /t REG_DWORD /d 1 /f
+          $env:REFUSED_SIZE = 16
+          cargo test -- --ignored --exact ops::tests::remove_refused_when_recycle_bin_cannot_take_it
+
+  # RustSec advisories for the crates built into the binaries (deny.toml).
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
 
   linux:
     # Oldest hosted image, so the binary runs on older glibc versions too.
@@ -96,7 +130,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows, linux]
+    needs: [macos, windows, linux, advisories]
     runs-on: ubuntu-latest
     permissions:
       contents: write

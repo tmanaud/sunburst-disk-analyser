@@ -56,8 +56,13 @@ impl Default for Settings {
     }
 }
 
+/// The app's own folder for settings and the crash report.
+pub fn folder() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("sunburst-disk-analyser"))
+}
+
 fn file() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("sunburst-disk-analyser").join("settings.json"))
+    folder().map(|d| d.join("settings.json"))
 }
 
 /// A settings file is a few hundred bytes; anything far larger is not ours.

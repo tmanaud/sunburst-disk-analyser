@@ -1,0 +1,21 @@
+# `cargo deny check advisories`, run by CI: RustSec advisories for the
+# crates built into the release binaries.
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+# Unmaintained or unsound crates deeper in the tree are reported, not fatal.
+unmaintained = "workspace"
+unsound = "workspace"
+ignore = [
+    # quick-xml 0.30 comes through zbus-lockstep (Linux accessibility), which
+    # atspi-common only calls in its own tests: no XML is parsed at run time.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml is only used at build and test time" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml is only used at build and test time" },
+]

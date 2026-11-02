@@ -832,13 +832,170 @@ fn has_recycle_bin(path: &Path) -> bool {
     unsafe { GetDriveTypeW(wide.as_ptr()) == DRIVE_FIXED }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn move_to_trash(src: &Source) -> Result<(), String> {
-    #[cfg(windows)]
     if !has_recycle_bin(src.path) {
         return Err("This drive has no Recycle Bin: the item would be deleted for good, so it was left in place".into());
     }
-    trash::TrashContext::default().delete(src.path).map_err(|e| e.to_string())
+    recycle_bin::recycle(&plain(src.path))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn move_to_trash(_src: &Source) -> Result<(), String> {
+    Err("Removal is not supported on this system".into())
+}
+
+/// Windows removal through the shell, which may only recycle.
+///
+/// Where the Recycle Bin cannot take an item (turned off, or smaller than
+/// the item), the shell deletes it for good. The progress sink sees each
+/// deletion before it happens and refuses those that would not recycle.
+#[cfg(windows)]
+mod recycle_bin {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use windows::core::{implement, Ref, Result, HRESULT, PCWSTR};
+    use windows::Win32::Foundation::E_ABORT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
+        SHCreateItemFromParsingName, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI, FOF_WANTNUKEWARNING,
+        TSF_DELETE_RECYCLE_IF_POSSIBLE,
+    };
+
+    /// Moves `path` (without a `\\?\` prefix) to the Recycle Bin, or leaves it.
+    pub fn recycle(path: &Path) -> std::result::Result<(), String> {
+        let refused = Arc::new(AtomicBool::new(false));
+        // SAFETY: COM is set up and torn down on this thread, and every
+        // argument outlives the call.
+        let outcome = unsafe { delete(path, &refused) };
+        if refused.load(Ordering::Acquire) {
+            return Err("The Recycle Bin cannot take this item (turned off or too small): it would be deleted for good, so it was left in place".into());
+        }
+        match outcome {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("Windows stopped the removal".into()),
+            Err(e) => Err(e.message()),
+        }
+    }
+
+    /// The shell's delete; true when Windows aborted it.
+    unsafe fn delete(path: &Path, refused: &Arc<AtomicBool>) -> Result<bool> {
+        // The shell's file operations need a single-threaded apartment.
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok()?;
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() }
+            }
+        }
+        // Declared first, so dropped after the COM objects below.
+        let _apartment = Apartment;
+        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+        // Should the sink ever miss a deletion, the nuke warning still makes
+        // Windows ask before deleting for good.
+        op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_WANTNUKEWARNING)?;
+        let sink: IFileOperationProgressSink = RecycleOnly { refused: refused.clone() }.into();
+        let cookie = op.Advise(&sink)?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)?;
+        op.DeleteItem(&item, None)?;
+        let performed = op.PerformOperations();
+        let _ = op.Unadvise(cookie);
+        performed?;
+        Ok(op.GetAnyOperationsAborted()?.as_bool())
+    }
+
+    #[implement(IFileOperationProgressSink)]
+    struct RecycleOnly {
+        refused: Arc<AtomicBool>,
+    }
+
+    impl IFileOperationProgressSink_Impl for RecycleOnly_Impl {
+        fn PreDeleteItem(&self, flags: u32, _item: Ref<IShellItem>) -> Result<()> {
+            if flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
+                self.refused.store(true, Ordering::Release);
+                return Err(E_ABORT.into());
+            }
+            Ok(())
+        }
+
+        // The other notifications need no answer.
+        fn StartOperations(&self) -> Result<()> {
+            Ok(())
+        }
+        fn FinishOperations(&self, _: HRESULT) -> Result<()> {
+            Ok(())
+        }
+        fn PreRenameItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
+            Ok(())
+        }
+        fn PostRenameItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR, _: HRESULT, _: Ref<IShellItem>) -> Result<()> {
+            Ok(())
+        }
+        fn PreMoveItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
+            Ok(())
+        }
+        fn PostMoveItem(
+            &self,
+            _: u32,
+            _: Ref<IShellItem>,
+            _: Ref<IShellItem>,
+            _: &PCWSTR,
+            _: HRESULT,
+            _: Ref<IShellItem>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn PreCopyItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
+            Ok(())
+        }
+        fn PostCopyItem(
+            &self,
+            _: u32,
+            _: Ref<IShellItem>,
+            _: Ref<IShellItem>,
+            _: &PCWSTR,
+            _: HRESULT,
+            _: Ref<IShellItem>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn PostDeleteItem(&self, _: u32, _: Ref<IShellItem>, _: HRESULT, _: Ref<IShellItem>) -> Result<()> {
+            Ok(())
+        }
+        fn PreNewItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> Result<()> {
+            Ok(())
+        }
+        fn PostNewItem(
+            &self,
+            _: u32,
+            _: Ref<IShellItem>,
+            _: &PCWSTR,
+            _: &PCWSTR,
+            _: u32,
+            _: HRESULT,
+            _: Ref<IShellItem>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn UpdateProgress(&self, _: u32, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn ResetTimer(&self) -> Result<()> {
+            Ok(())
+        }
+        fn PauseTimer(&self) -> Result<()> {
+            Ok(())
+        }
+        fn ResumeTimer(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1101,5 +1258,43 @@ mod tests {
         wait(&p);
         assert!(p.results.lock()[0].error.is_none(), "{:?}", p.results.lock()[0].error);
         assert!(!target.exists());
+    }
+
+    /// Windows: the removed item can be found in the Recycle Bin, then is
+    /// purged from it. Run explicitly.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn removed_item_is_in_recycle_bin() {
+        let (_d, src, _dst) = fixture();
+        let name = format!("recycle-check-{}.txt", std::process::id());
+        let target = src.join(&name);
+        fs::write(&target, b"keep me").unwrap();
+        let p = run(OpKind::Remove, vec![item(target.clone())], None);
+        wait(&p);
+        assert!(p.results.lock()[0].error.is_none(), "{:?}", p.results.lock()[0].error);
+        assert!(!target.exists());
+        let binned: Vec<_> = trash::os_limited::list().unwrap().into_iter().filter(|t| t.name == name.as_str()).collect();
+        assert_eq!(binned.len(), 1, "not in the Recycle Bin");
+        trash::os_limited::purge_all(binned).unwrap();
+    }
+
+    /// Windows, with the Recycle Bin turned off or smaller than
+    /// `REFUSED_SIZE` bytes: removal is refused and the file kept. Run
+    /// explicitly; the CI workflow sets the bin up.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn remove_refused_when_recycle_bin_cannot_take_it() {
+        let size: usize = std::env::var("REFUSED_SIZE").expect("REFUSED_SIZE").parse().unwrap();
+        let (_d, src, _dst) = fixture();
+        let target = src.join("refused.bin");
+        let content = vec![7u8; size];
+        fs::write(&target, &content).unwrap();
+        let p = run(OpKind::Remove, vec![item(target.clone())], None);
+        wait(&p);
+        let error = p.results.lock()[0].error.clone();
+        assert!(error.as_deref().is_some_and(|e| e.contains("for good")), "{error:?}");
+        assert_eq!(fs::read(&target).unwrap(), content);
     }
 }

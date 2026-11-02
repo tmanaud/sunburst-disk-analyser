@@ -2,6 +2,7 @@
 
 mod app;
 mod chart;
+mod crash;
 mod demo;
 mod dialogs;
 mod export;
@@ -47,6 +48,7 @@ Usage: sunburst-disk-analyser [OPTIONS] [FOLDER]
   -V, --version               Show the version";
 
 fn main() -> eframe::Result<()> {
+    crash::install();
     let mut opts = app::Options::default();
     let mut size = [1180.0f32, 780.0f32];
     let mut args = std::env::args().skip(1);
