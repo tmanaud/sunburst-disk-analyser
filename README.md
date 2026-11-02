@@ -13,11 +13,11 @@ Animation and screenshots use demo data. The animated scan is sped up.
 
 ## Download
 
-| System | Download 1.1.0 | First launch |
+| System | Download 1.1.1 | First launch |
 | --- | --- | --- |
-| macOS 11+ · Intel / Apple Silicon | [DMG](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.0/Sunburst-Disk-Analyser-1.1.0-macos-universal.dmg) | Drag the app to Applications. Not notarised: open it once, then click **Open Anyway** in System Settings → Privacy & Security. |
-| Windows 10/11 · x64 | [ZIP](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.0/Sunburst-Disk-Analyser-1.1.0-windows-x64.zip) | Unzip and run **Sunburst Disk Analyser.exe**. SmartScreen: **More info → Run anyway**. |
-| Linux · x86_64 | [AppImage](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.0/Sunburst-Disk-Analyser-1.1.0-linux-x86_64.AppImage) | `chmod +x` the AppImage, then run it. Needs glibc 2.35+ and OpenGL. |
+| macOS 11+ · Intel / Apple Silicon | [DMG](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.1/Sunburst-Disk-Analyser-1.1.1-macos-universal.dmg) | Drag the app to Applications. Not notarised: open it once, then click **Open Anyway** in System Settings → Privacy & Security. |
+| Windows 10/11 · x64 | [ZIP](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.1/Sunburst-Disk-Analyser-1.1.1-windows-x64.zip) | Unzip and run **Sunburst Disk Analyser.exe**. SmartScreen: **More info → Run anyway**. |
+| Linux · x86_64 | [AppImage](https://github.com/tmanaud/sunburst-disk-analyser/releases/download/v1.1.1/Sunburst-Disk-Analyser-1.1.1-linux-x86_64.AppImage) | `chmod +x` the AppImage, then run it. Needs glibc 2.35+ and OpenGL. |
 
 macOS: allow **Full Disk Access** in System Settings → Privacy & Security for complete results.
 
