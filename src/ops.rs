@@ -863,8 +863,7 @@ mod recycle_bin {
     };
     use windows::Win32::UI::Shell::{
         FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
-        SHCreateItemFromParsingName, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI, FOF_WANTNUKEWARNING,
-        TSF_DELETE_RECYCLE_IF_POSSIBLE,
+        SHCreateItemFromParsingName, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI, TSF_DELETE_RECYCLE_IF_POSSIBLE,
     };
 
     /// Moves `path` (without a `\\?\` prefix) to the Recycle Bin, or leaves it.
@@ -896,9 +895,9 @@ mod recycle_bin {
         // Declared first, so dropped after the COM objects below.
         let _apartment = Apartment;
         let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-        // Should the sink ever miss a deletion, the nuke warning still makes
-        // Windows ask before deleting for good.
-        op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_WANTNUKEWARNING)?;
+        // No nuke warning: for an item too large for the bin, Windows would
+        // ask before the sink is consulted. The CI workflow checks both cases.
+        op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE)?;
         let sink: IFileOperationProgressSink = RecycleOnly { refused: refused.clone() }.into();
         let cookie = op.Advise(&sink)?;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
