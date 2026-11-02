@@ -74,8 +74,9 @@ pub fn script() -> Vec<Step> {
         Wait(0.08),
         Click,
         Wait(0.2),
-        // Off the tab, so that the last frame shows it whole.
-        Move(Share(0.6, 0.046), 0.4),
+        // Between the tabs and the disk bar, so that the last frame shows both
+        // whole, with no tooltip.
+        Move(Share(0.5, 0.046), 0.4),
         Wait(1.0),
     ]
 }
