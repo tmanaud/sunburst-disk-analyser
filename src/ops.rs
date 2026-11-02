@@ -1,7 +1,9 @@
 //! Remove (to the system Trash), move and copy of selected items.
 //!
-//! Nothing here ever overwrites an existing file, deletes permanently or
-//! falls back to copy-then-delete: a remove or a move is a rename, or fails.
+//! Nothing here ever overwrites an existing file or falls back to
+//! copy-then-delete: a remove or a move is a rename, or fails. Nothing is
+//! deleted for good, unless Windows asks and the user agrees (an item too
+//! large for its Recycle Bin).
 
 use crate::tree::NodeId;
 use parking_lot::Mutex;
@@ -847,9 +849,9 @@ fn move_to_trash(_src: &Source) -> Result<(), String> {
 
 /// Windows removal through the shell, which may only recycle.
 ///
-/// Where the Recycle Bin cannot take an item (turned off, or smaller than
-/// the item), the shell deletes it for good. The progress sink sees each
-/// deletion before it happens and refuses those that would not recycle.
+/// Where the Recycle Bin is turned off, the shell deletes for good: the
+/// progress sink sees each deletion before it happens and refuses those that
+/// would not recycle. For an item larger than the bin, Windows asks first.
 #[cfg(windows)]
 mod recycle_bin {
     use std::os::windows::ffi::OsStrExt;
@@ -863,7 +865,8 @@ mod recycle_bin {
     };
     use windows::Win32::UI::Shell::{
         FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
-        SHCreateItemFromParsingName, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI, TSF_DELETE_RECYCLE_IF_POSSIBLE,
+        SHCreateItemFromParsingName, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI, FOF_WANTNUKEWARNING,
+        TSF_DELETE_RECYCLE_IF_POSSIBLE,
     };
 
     /// Moves `path` (without a `\\?\` prefix) to the Recycle Bin, or leaves it.
@@ -895,9 +898,10 @@ mod recycle_bin {
         // Declared first, so dropped after the COM objects below.
         let _apartment = Apartment;
         let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-        // No nuke warning: for an item too large for the bin, Windows would
-        // ask before the sink is consulted. The CI workflow checks both cases.
-        op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE)?;
+        // The sink sees a turned-off bin, not an item too large for it: that
+        // one Windows would delete for good unless the nuke warning makes it
+        // ask first. The CI workflow checks both cases.
+        op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_WANTNUKEWARNING)?;
         let sink: IFileOperationProgressSink = RecycleOnly { refused: refused.clone() }.into();
         let cookie = op.Advise(&sink)?;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -1279,22 +1283,36 @@ mod tests {
         trash::os_limited::purge_all(binned).unwrap();
     }
 
-    /// Windows, with the Recycle Bin turned off or smaller than
-    /// `REFUSED_SIZE` bytes: removal is refused and the file kept. Run
-    /// explicitly; the CI workflow sets the bin up.
+    /// Windows, with the Recycle Bin turned off: removal is refused and the
+    /// file kept. Run explicitly; the CI workflow turns the bin off.
     #[cfg(windows)]
     #[test]
     #[ignore]
-    fn remove_refused_when_recycle_bin_cannot_take_it() {
-        let size: usize = std::env::var("REFUSED_SIZE").expect("REFUSED_SIZE").parse().unwrap();
+    fn remove_refused_when_recycle_bin_is_off() {
         let (_d, src, _dst) = fixture();
-        let target = src.join("refused.bin");
-        let content = vec![7u8; size];
-        fs::write(&target, &content).unwrap();
+        let target = src.join("file.txt");
         let p = run(OpKind::Remove, vec![item(target.clone())], None);
         wait(&p);
         let error = p.results.lock()[0].error.clone();
         assert!(error.as_deref().is_some_and(|e| e.contains("for good")), "{error:?}");
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+    }
+
+    /// Windows, with a Recycle Bin smaller than `ITEM_SIZE` bytes: Windows
+    /// asks before deleting the item for good, and with nobody to answer,
+    /// nothing happens. Run explicitly; the CI workflow shrinks the bin.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn remove_too_big_for_recycle_bin_waits_for_an_answer() {
+        let size: usize = std::env::var("ITEM_SIZE").expect("ITEM_SIZE").parse().unwrap();
+        let (_d, src, _dst) = fixture();
+        let target = src.join("too-big.bin");
+        let content = vec![7u8; size];
+        fs::write(&target, &content).unwrap();
+        let p = run(OpKind::Remove, vec![item(target.clone())], None);
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        assert!(!p.finished.load(Ordering::Acquire), "{:?}", p.results.lock().first().map(|r| r.error.clone()));
         assert_eq!(fs::read(&target).unwrap(), content);
     }
 }

@@ -29,7 +29,7 @@ macOS: allow **Full Disk Access** in System Settings → Privacy & Security for 
 2. Explore the chart and folders, or search.
 3. Tick items. Click **Review and Remove**. The arrow offers **Move** or **Copy**.
 
-Remove sends items to the **Trash / Recycle Bin**: nothing is deleted permanently, nothing is overwritten. Empty the Trash to free the space.
+Remove sends items to the **Trash / Recycle Bin** and never overwrites anything. Empty the Trash to free the space.
 
 The only automatic network request is an update check at launch. Turn it off in **Settings**.
 

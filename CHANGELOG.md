@@ -2,6 +2,19 @@
 
 What changed in each release. Downloads are on the [releases page](https://github.com/tmanaud/sunburst-disk-analyser/releases).
 
+## 1.1.1 - 2026-11-02
+
+### Safety
+
+- Windows refuses a removal when the Recycle Bin is turned off; the item stays in place.
+- The update check uses newer TLS libraries, which reject the distrusted emSign certificates.
+
+### New
+
+- A crash leaves `crash.log` beside the settings, to attach to an issue.
+
+[Details](https://github.com/tmanaud/sunburst-disk-analyser/blob/main/docs/DETAILS.md)
+
 ## 1.1.0 - 2026-11-02
 
 ### New

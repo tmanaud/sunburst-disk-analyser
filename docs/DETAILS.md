@@ -31,7 +31,7 @@ Quick Look is macOS only; other systems open the file with its default app, exce
 
 ## File operations
 
-- Linux: removal moves the item into its own volume's Trash (your home Trash or `.Trash-<uid>`), or is refused. macOS refuses on volumes without a Trash. Windows refuses on drives without a Recycle Bin, such as network shares and removable drives, and when the Recycle Bin is turned off or too small for the item.
+- Linux: removal moves the item into its own volume's Trash (your home Trash or `.Trash-<uid>`), or is refused. macOS refuses on volumes without a Trash. Windows refuses on drives without a Recycle Bin, such as network shares and removable drives, and when the Recycle Bin is turned off. For an item too big for the Recycle Bin, Windows asks before deleting it for good.
 - Volume roots, the home folder, its standard folders and system folders cannot be selected. Hidden items need permission in Settings. Mounted volumes and unreadable folders cannot be selected.
 - Right before acting, each item is compared with what you reviewed: the same file with the same size and date, or the same folder (on Windows, the same path). Changed or missing items are skipped and reported; scan again to act on them.
 - A folder goes with everything it holds at that moment, including files added since the scan.
