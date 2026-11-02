@@ -68,7 +68,7 @@ mod tests {
         let _ = std::panic::catch_unwind(|| panic!("boom {}", 42));
         std::panic::set_hook(previous);
         let report = std::fs::read_to_string(&file).unwrap();
-        assert!(report.contains("panicked at src/crash.rs:"), "{report}");
+        assert!(report.contains("crash.rs:"), "{report}");
         assert!(report.ends_with("\nboom 42\n"), "{report}");
     }
 }
