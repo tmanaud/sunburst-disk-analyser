@@ -18,7 +18,7 @@
 
 Pictures on every system; PDFs and MOV/MP4 videos on macOS. Install [ffmpeg](https://ffmpeg.org) (not bundled) for other videos on any system.
 
-Quick Look is macOS only; other systems open the file with its default app. File icons are generic.
+Quick Look is macOS only; other systems open the file with its default app, except a Linux `.desktop` file, which is shown in its folder rather than run. File icons are generic.
 
 ## Sizes and scan limits
 
