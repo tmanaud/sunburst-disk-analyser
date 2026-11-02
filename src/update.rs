@@ -404,7 +404,7 @@ fn rename_no_replace(_from: &Path, _to: &Path) -> io::Result<()> {
 pub fn install_steps(file: &Path) -> &'static str {
     let name = file.to_string_lossy();
     if cfg!(target_os = "macos") {
-        t("Quit this app, open the disk image and drag Sunburst Disk Analyser to Applications to replace the old version. macOS may then ask again for Full Disk Access.")
+        t("Quit the app, open the disk image and drag the new app to Applications. macOS may ask for Full Disk Access again.")
     } else if cfg!(windows) {
         t("Quit this app, extract the archive and replace the old application files with the new ones.")
     } else if name.ends_with(".AppImage") {

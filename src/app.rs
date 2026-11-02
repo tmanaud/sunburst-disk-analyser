@@ -441,7 +441,7 @@ impl App {
             CheckError::ParentSelected => t("This item is inside a folder that is already selected."),
             CheckError::Hidden => t("Hidden items are protected. You can allow removing them in Settings."),
             CheckError::System => t("This item is required by the system and cannot be selected."),
-            CheckError::Empty => t("This file takes up no space on your disk. There is no need to remove it."),
+            CheckError::Empty => t("This file takes up no disk space."),
             CheckError::Unscanned => t("This folder was not scanned completely and cannot be selected."),
         }
     }

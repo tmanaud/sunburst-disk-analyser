@@ -148,7 +148,6 @@ impl App {
                     let fraction = if progress.total == 0 { 1.0 } else { done as f32 / progress.total as f32 };
                     ui.add(egui::ProgressBar::new(fraction).desired_width(400.0).fill(pal.accent));
                     ui.label(RichText::new(format!("{done} / {}", progress.total)).color(pal.text_dim));
-                    ui.label(RichText::new(t("The process can take some time. Please wait until it is finished.")).color(pal.text_dim));
                     buttons(ui, |ui| {
                         if secondary(ui, t("Stop")) {
                             progress.cancel.store(true, Ordering::Release);
@@ -288,7 +287,7 @@ impl App {
                         let status = if disk_access {
                             t("Full Disk Access is granted.")
                         } else {
-                            t("macOS protects some folders. Grant Full Disk Access to this app so that every folder can be measured.")
+                            t("Grant Full Disk Access to measure the folders macOS protects.")
                         };
                         ui.label(RichText::new(status).color(pal.text_dim));
                         if secondary(ui, t("Open System Settings")) && !demo {
@@ -311,7 +310,7 @@ impl App {
                 Dialog::About => {
                     ui.set_width(400.0);
                     title(ui, t("Sunburst Disk Analyser"));
-                    ui.label(t("See what takes up space on your disks with an interactive sunburst chart, then remove, move or copy what you no longer need."));
+                    ui.label(t("Find what takes up disk space. Remove, move or copy what you no longer need."));
                     ui.add_space(4.0);
                     project_info(ui, pal.text_dim);
                     buttons(ui, |ui| {
@@ -324,14 +323,14 @@ impl App {
                     ui.set_width(500.0);
                     title(ui, t("Sunburst Disk Analyser Help"));
                     let keys = if cfg!(target_os = "macos") { ["⌘", "⌥"] } else { ["Ctrl", "Alt"] };
-                    let picking = tf("Shift-click selects every row from the last one clicked; {}-click or {}-click adds or removes one. With several rows selected in a column, the next pane lists the biggest files they hold.", &keys);
+                    let picking = tf("Shift-click selects a range of rows; {}-click or {}-click adds or removes one. Several folders selected in a column show their biggest files in the next pane.", &keys);
                     for line in [
-                        t("Pick a disk or folder in the list on the left, or drop one on the window, then click Start Scanning."),
-                        t("Folders Outline lists the content by size. Click a folder to open it in the next column; click a file to preview it, double-click it to open it. Scroll sideways to see the earlier columns, or use the arrow keys."),
-                        t("In the chart every ring is one folder level. Hover a segment for details, click it to select it, click the centre to go back up."),
+                        t("Choose a disk or folder on the left, or drop one on the window. Click Start Scanning."),
+                        t("Folders Outline sorts by size. Click a folder to open it, a file to preview it; double-click a file to open it. Arrow keys or sideways scrolling move through the columns."),
+                        t("The chart has one ring per folder level. Hover for details, click to select, click the centre to go up."),
                         t("Biggest Files lists the largest files of the whole scan."),
                         picking.as_str(),
-                        t("Tick items, then use the Review button to move them to the Trash, or to move or copy them to another folder."),
+                        t("Tick items, then click Review and Remove. Its arrow switches to Move or Copy."),
                         t("Shift-click a checkbox to tick or untick every row from the last checkbox clicked."),
                         t("Right-click any item for more actions."),
                     ] {
