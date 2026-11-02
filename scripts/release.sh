@@ -20,25 +20,29 @@ grep -Eq "^## ${version//./\\.}( |$)" CHANGELOG.md || die "CHANGELOG.md has no \
 git fetch --quiet origin main --tags
 [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main is not the same as origin/main"
 ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "$tag exists already"
+# The README links straight to the files of the release; their version is updated below.
+grep -Eq "releases/download/v[0-9]+\.[0-9]+\.[0-9]+/" README.md || die "README.md has no download links to update"
 
 start="$(git rev-parse HEAD)"
 # Checksums of what the release commit holds, to make sure it is still what was tested.
-cargo_files() { shasum -a 256 Cargo.toml Cargo.lock; }
+cargo_files() { shasum -a 256 Cargo.toml Cargo.lock README.md; }
 release_files() { cargo_files; find docs/screenshots -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256; }
 current="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 echo "Version $current -> $version"
 perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' Cargo.toml
 cargo update --quiet --workspace --offline 2>/dev/null || cargo update --quiet --workspace
+perl -pi -e 's{(releases/download/v|Sunburst-Disk-Analyser-|Download )\d+\.\d+\.\d+}{${1}'"$version"'}g' README.md
+grep -q "releases/download/$tag/" README.md || die "the download links of README.md were not updated"
 bumped="$(cargo_files)"
 
 echo "Tests"
 cargo test --quiet
 cargo clippy --quiet --all-targets -- -D warnings
-[[ "$(cargo_files)" == "$bumped" ]] || die "Cargo.toml or Cargo.lock changed during the tests; nothing was committed"
+[[ "$(cargo_files)" == "$bumped" ]] || die "Cargo.toml, Cargo.lock or README.md changed during the tests; nothing was committed"
 
 echo "README pictures"
 scripts/screenshots.sh
-[[ "$(cargo_files)" == "$bumped" ]] || die "Cargo.toml or Cargo.lock changed while the pictures were made; nothing was committed"
+[[ "$(cargo_files)" == "$bumped" ]] || die "Cargo.toml, Cargo.lock or README.md changed while the pictures were made; nothing was committed"
 tested="$(release_files)"
 
 echo
@@ -48,7 +52,7 @@ echo "Check the pictures before publishing, for example:"
 echo "  open -a Safari docs/screenshots/demo.webp; open docs/screenshots/*.png"
 read -r -p "Commit, tag $tag and push? [y/N] " answer
 if [[ "$answer" != [yY] ]]; then
-    echo "Nothing was committed. To undo: git checkout -- Cargo.toml Cargo.lock docs/screenshots"
+    echo "Nothing was committed. To undo: git checkout -- Cargo.toml Cargo.lock README.md docs/screenshots"
     exit 1
 fi
 
@@ -57,14 +61,14 @@ fi
     || die "main moved while the release was prepared; nothing was committed"
 [[ -z "$(git diff --cached --name-only)" ]] || die "files were staged meanwhile; nothing was committed"
 unexpected="$(git status --porcelain --untracked-files=all | cut -c4- \
-    | grep -vE '^(Cargo\.toml|Cargo\.lock|docs/screenshots/.+)$' || true)"
+    | grep -vE '^(Cargo\.toml|Cargo\.lock|README\.md|docs/screenshots/.+)$' || true)"
 [[ -z "$unexpected" ]] || die "unexpected changes, nothing was committed:
 $unexpected"
 [[ "$(cargo_files)" == "$bumped" && "$(release_files)" == "$tested" ]] \
-    || die "Cargo.toml, Cargo.lock or a picture changed after the tests; nothing was committed"
+    || die "Cargo.toml, Cargo.lock, README.md or a picture changed after the tests; nothing was committed"
 
-git add Cargo.toml Cargo.lock docs/screenshots
-git commit --quiet -m "release: $tag" -- Cargo.toml Cargo.lock docs/screenshots
+git add Cargo.toml Cargo.lock README.md docs/screenshots
+git commit --quiet -m "release: $tag" -- Cargo.toml Cargo.lock README.md docs/screenshots
 git tag -a "$tag" -m "$tag"
 git push --atomic origin main "$tag"
 echo "Pushed $tag: the release workflow builds and publishes it."
