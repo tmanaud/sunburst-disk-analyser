@@ -19,6 +19,12 @@ jobs:
   macos:
     # GitHub keeps the two latest macOS images; macos-14 is retired on 2026-11-02.
     runs-on: macos-15
+    env:
+      # Developer ID signing and notarisation, for tags and manual runs, once
+      # these secrets exist: MACOS_CERTIFICATE_P12 (base64 of the .p12),
+      # MACOS_CERTIFICATE_PASSWORD, MACOS_SIGN_IDENTITY, NOTARY_KEY_P8 (the
+      # App Store Connect API key), NOTARY_KEY_ID and NOTARY_ISSUER.
+      SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -36,7 +42,28 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
       - name: Test
         run: cargo test
+      - name: Signing keychain
+        if: env.SIGNING == 'true'
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
       - name: Package
+        env:
+          MACOS_SIGN_IDENTITY: ${{ env.SIGNING == 'true' && secrets.MACOS_SIGN_IDENTITY || '' }}
+          NOTARY_KEY_P8: ${{ env.SIGNING == 'true' && secrets.NOTARY_KEY_P8 || '' }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
         run: ./packaging/build-macos.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -70,6 +97,7 @@ jobs:
         timeout-minutes: 10
         run: cargo test -- --ignored --exact ops::tests::remove_goes_to_trash ops::tests::removed_item_is_in_recycle_bin
       - name: Removal refused when the Recycle Bin is too small
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: pwsh
         run: |
@@ -81,6 +109,7 @@ jobs:
           $env:REFUSED_SIZE = 4194304
           cargo test -- --ignored --exact ops::tests::remove_refused_when_recycle_bin_cannot_take_it
       - name: Removal refused when the Recycle Bin is off
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: pwsh
         run: |

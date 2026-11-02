@@ -1267,7 +1267,8 @@ mod tests {
     #[ignore]
     fn removed_item_is_in_recycle_bin() {
         let (_d, src, _dst) = fixture();
-        let name = format!("recycle-check-{}.txt", std::process::id());
+        // The bin lists display names, which hide known extensions: none here.
+        let name = format!("recycle-check-{}", std::process::id());
         let target = src.join(&name);
         fs::write(&target, b"keep me").unwrap();
         let p = run(OpKind::Remove, vec![item(target.clone())], None);
