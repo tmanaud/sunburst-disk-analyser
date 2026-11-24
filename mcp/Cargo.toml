@@ -1,0 +1,32 @@
+[package]
+name = "sunburst-disk-analyser-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server exposing the Sunburst Disk Analyser scanner to AI assistants, read-only"
+license = "MIT"
+repository = "https://github.com/tmanaud/sunburst-disk-analyser"
+publish = false
+
+# The scanner and the tree are shared with the desktop app (see src/main.rs):
+# this crate only adds the MCP protocol and the analyses, without any GUI
+# dependency.
+[[bin]]
+name = "sunburst-mcp"
+path = "src/main.rs"
+
+[dependencies]
+parking_lot = "0.12"
+serde_json = "1"
+sysinfo = { version = "0.33", default-features = false, features = ["disk"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
